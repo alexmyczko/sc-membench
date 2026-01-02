@@ -154,6 +154,14 @@ static double g_max_runtime = DEFAULT_MAX_RUNTIME;
 static double g_prev_latency_ns = 0;
 static size_t g_prev_latency_size = 0;
 
+/* Detected cache sizes (per core) */
+static size_t g_l1_cache_size = 0;
+static size_t g_l2_cache_size = 0;
+static size_t g_l3_cache_size = 0;
+
+/* Minimum total buffer size - adaptive based on cache topology */
+static size_t g_min_total_size = 4096;  /* Default 4KB, updated after cache detection */
+
 /* ============================================================================
  * Timing
  * ============================================================================ */
@@ -601,6 +609,188 @@ static void free_buffer(void *buf, size_t size) {
 }
 
 /* ============================================================================
+ * Cache topology detection using hwloc (portable: x86, arm64, etc.)
+ * 
+ * Install hwloc:
+ *   Debian/Ubuntu: apt-get install libhwloc-dev
+ *   RHEL/CentOS:   yum install hwloc-devel
+ *   macOS:         brew install hwloc
+ * ============================================================================ */
+
+#ifdef USE_HWLOC
+#include <hwloc.h>
+
+static hwloc_topology_t g_topology = NULL;
+
+/* Detect cache sizes using hwloc */
+static void init_cache_info(void) {
+    if (hwloc_topology_init(&g_topology) < 0) {
+        goto use_defaults;
+    }
+    
+    if (hwloc_topology_load(g_topology) < 0) {
+        hwloc_topology_destroy(g_topology);
+        g_topology = NULL;
+        goto use_defaults;
+    }
+    
+    /* Find cache sizes by iterating through cache objects */
+    int depth;
+    
+    /* L1 Data Cache */
+    depth = hwloc_get_type_depth(g_topology, HWLOC_OBJ_L1CACHE);
+    if (depth != HWLOC_TYPE_DEPTH_UNKNOWN) {
+        hwloc_obj_t obj = hwloc_get_obj_by_depth(g_topology, depth, 0);
+        if (obj && obj->attr && obj->attr->cache.type != HWLOC_OBJ_CACHE_INSTRUCTION) {
+            g_l1_cache_size = obj->attr->cache.size;
+        }
+    }
+    
+    /* L2 Cache */
+    depth = hwloc_get_type_depth(g_topology, HWLOC_OBJ_L2CACHE);
+    if (depth != HWLOC_TYPE_DEPTH_UNKNOWN) {
+        hwloc_obj_t obj = hwloc_get_obj_by_depth(g_topology, depth, 0);
+        if (obj && obj->attr) {
+            g_l2_cache_size = obj->attr->cache.size;
+        }
+    }
+    
+    /* L3 Cache */
+    depth = hwloc_get_type_depth(g_topology, HWLOC_OBJ_L3CACHE);
+    if (depth != HWLOC_TYPE_DEPTH_UNKNOWN) {
+        hwloc_obj_t obj = hwloc_get_obj_by_depth(g_topology, depth, 0);
+        if (obj && obj->attr) {
+            g_l3_cache_size = obj->attr->cache.size;
+        }
+    }
+    
+    /* Count total L3 cache (sum across all L3 objects for distributed caches) */
+    if (g_l3_cache_size > 0) {
+        depth = hwloc_get_type_depth(g_topology, HWLOC_OBJ_L3CACHE);
+        int num_l3 = hwloc_get_nbobjs_by_depth(g_topology, depth);
+        if (g_verbose && num_l3 > 1) {
+            fprintf(stderr, "Note: %d L3 caches detected (distributed across dies)\n", num_l3);
+        }
+    }
+    
+use_defaults:
+    /* Set defaults if detection failed */
+    if (g_l1_cache_size == 0) g_l1_cache_size = 32 * 1024;      /* 32 KB */
+    if (g_l2_cache_size == 0) g_l2_cache_size = 256 * 1024;     /* 256 KB */
+    if (g_l3_cache_size == 0) g_l3_cache_size = 8 * 1024 * 1024; /* 8 MB */
+    
+    /* Calculate adaptive minimum total size:
+     * Use L1 cache size × num_cpus so each thread can have a meaningful buffer.
+     * This ensures we can parallelize even the smallest tests. */
+    g_min_total_size = g_l1_cache_size * g_num_cpus;
+    
+    /* But cap it at a reasonable minimum for small systems */
+    if (g_min_total_size < 64 * 1024) {
+        g_min_total_size = 64 * 1024;  /* At least 64 KB */
+    }
+    
+    if (g_verbose) {
+        fprintf(stderr, "Cache (hwloc): L1d=%zuKB, L2=%zuKB, L3=%zuKB (per core)\n",
+                g_l1_cache_size / 1024, g_l2_cache_size / 1024, g_l3_cache_size / 1024);
+        fprintf(stderr, "Minimum total test size: %zu KB (L1 × %d CPUs)\n",
+                g_min_total_size / 1024, g_num_cpus);
+    }
+}
+
+static void cleanup_hwloc(void) {
+    if (g_topology) {
+        hwloc_topology_destroy(g_topology);
+        g_topology = NULL;
+    }
+}
+
+#else /* !USE_HWLOC - fallback to sysfs parsing */
+
+/* Parse cache size from sysfs (handles "48K", "1024K", "32768K" format) */
+static size_t parse_cache_size_sysfs(const char *str) {
+    size_t size = 0;
+    char unit = 0;
+    if (sscanf(str, "%zu%c", &size, &unit) >= 1) {
+        if (unit == 'K' || unit == 'k') size *= 1024;
+        else if (unit == 'M' || unit == 'm') size *= 1024 * 1024;
+    }
+    return size;
+}
+
+/* Read cache info from sysfs */
+static void init_cache_info(void) {
+    char path[256];
+    char buf[64];
+    FILE *f;
+    
+    /* Try to read cache info from sysfs (Linux) */
+    for (int index = 0; index < 10; index++) {
+        /* Read level */
+        snprintf(path, sizeof(path), 
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/level", index);
+        f = fopen(path, "r");
+        if (!f) continue;
+        int level = -1;
+        if (fgets(buf, sizeof(buf), f)) level = atoi(buf);
+        fclose(f);
+        if (level < 0) continue;
+        
+        /* Read type */
+        snprintf(path, sizeof(path), 
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/type", index);
+        f = fopen(path, "r");
+        if (!f) continue;
+        char type[32] = "";
+        if (fgets(type, sizeof(type), f)) type[strcspn(type, "\n")] = 0;
+        fclose(f);
+        
+        /* Skip instruction caches */
+        if (strcmp(type, "Instruction") == 0) continue;
+        
+        /* Read size */
+        snprintf(path, sizeof(path), 
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/size", index);
+        f = fopen(path, "r");
+        if (!f) continue;
+        size_t size = 0;
+        if (fgets(buf, sizeof(buf), f)) size = parse_cache_size_sysfs(buf);
+        fclose(f);
+        
+        if (size == 0) continue;
+        
+        switch (level) {
+            case 1: if (g_l1_cache_size == 0) g_l1_cache_size = size; break;
+            case 2: if (g_l2_cache_size == 0) g_l2_cache_size = size; break;
+            case 3: if (g_l3_cache_size == 0) g_l3_cache_size = size; break;
+        }
+    }
+    
+    /* Set defaults if detection failed */
+    if (g_l1_cache_size == 0) g_l1_cache_size = 32 * 1024;      /* 32 KB */
+    if (g_l2_cache_size == 0) g_l2_cache_size = 256 * 1024;     /* 256 KB */
+    if (g_l3_cache_size == 0) g_l3_cache_size = 8 * 1024 * 1024; /* 8 MB */
+    
+    /* Calculate adaptive minimum total size */
+    g_min_total_size = g_l1_cache_size * g_num_cpus;
+    if (g_min_total_size < 64 * 1024) {
+        g_min_total_size = 64 * 1024;
+    }
+    
+    if (g_verbose) {
+        fprintf(stderr, "Cache (sysfs): L1d=%zuKB, L2=%zuKB, L3=%zuKB (per core)\n",
+                g_l1_cache_size / 1024, g_l2_cache_size / 1024, g_l3_cache_size / 1024);
+        fprintf(stderr, "Minimum total test size: %zu KB (L1 × %d CPUs)\n",
+                g_min_total_size / 1024, g_num_cpus);
+    }
+}
+
+static void cleanup_hwloc(void) {
+    /* No-op when hwloc is not used */
+}
+
+#endif /* USE_HWLOC */
+
+/* ============================================================================
  * NUMA support
  * ============================================================================ */
 
@@ -660,6 +850,9 @@ static void init_system_info(void) {
         fprintf(stderr, "System: %d CPUs, %.2f GB memory\n", 
                 g_num_cpus, g_total_memory / (1024.0 * 1024 * 1024));
     }
+    
+    /* Detect cache topology (must be called after g_num_cpus is set) */
+    init_cache_info();
 }
 
 /* ============================================================================
@@ -976,18 +1169,30 @@ static size_t* get_sizes(int *count) {
     /* Limit to available memory (use max 50% of RAM) */
     size_t max_size = g_total_memory / 2;
     
+    /* Start from minimum total size (adaptive based on cache × CPUs) */
+    size_t min_size = g_min_total_size;
+    
     int n = 0;
     for (int i = 0; DEFAULT_SIZES[i] != 0; i++) {
-        if (DEFAULT_SIZES[i] <= max_size) n++;
+        if (DEFAULT_SIZES[i] >= min_size && DEFAULT_SIZES[i] <= max_size) n++;
     }
+    
+    /* Always have at least one size */
+    if (n == 0) n = 1;
     
     size_t *sizes = malloc((n + 1) * sizeof(size_t));
     int j = 0;
     for (int i = 0; DEFAULT_SIZES[i] != 0; i++) {
-        if (DEFAULT_SIZES[i] <= max_size) {
+        if (DEFAULT_SIZES[i] >= min_size && DEFAULT_SIZES[i] <= max_size) {
             sizes[j++] = DEFAULT_SIZES[i];
         }
     }
+    
+    /* If no sizes matched, use minimum size */
+    if (j == 0) {
+        sizes[j++] = min_size;
+    }
+    
     sizes[j] = 0;
     *count = j;
     return sizes;
@@ -1012,8 +1217,19 @@ static void print_result(const result_t *r) {
     }
 }
 
-/* Minimum per-thread buffer size (below this, overhead dominates) */
-#define MIN_PER_THREAD_SIZE (4 * 1024)  /* 4 KB */
+/* Get minimum per-thread buffer size - adaptive based on L1 cache.
+ * We want each thread to have enough data to measure meaningful bandwidth,
+ * but not so much that we can't parallelize small total sizes.
+ * Use L1_cache / 8 as a reasonable minimum (e.g., 48KB L1 → 6KB per thread). */
+static size_t get_min_per_thread_size(void) {
+    size_t min_size = g_l1_cache_size / 8;
+    
+    /* But not smaller than 1KB (too much overhead) or larger than 16KB */
+    if (min_size < 1024) min_size = 1024;
+    if (min_size > 16384) min_size = 16384;
+    
+    return min_size;
+}
 
 /* Maximum buffer size for latency test.
  * Must exceed largest L3 caches to measure true DRAM latency.
@@ -1122,7 +1338,7 @@ static result_t find_best_config(size_t total_size, operation_t op,
         size_t per_thread_size = effective_size / nthreads;
         
         /* Skip if per-thread buffer would be too small */
-        if (per_thread_size < MIN_PER_THREAD_SIZE) {
+        if (per_thread_size < get_min_per_thread_size()) {
             continue;
         }
         
@@ -1331,6 +1547,9 @@ int main(int argc, char *argv[]) {
     
     /* Run benchmarks */
     run_all_benchmarks();
+    
+    /* Cleanup */
+    cleanup_hwloc();
     
     return 0;
 }

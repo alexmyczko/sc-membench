@@ -33,11 +33,27 @@ make numa
 ## Build Options
 
 ```bash
-make              # Build without NUMA support
-make numa         # Build with NUMA support
-make all          # Build both versions
+make              # Basic version (sysfs cache detection, Linux only)
+make hwloc        # With hwloc (recommended - portable cache detection)
+make numa         # With NUMA support
+make full         # With hwloc + NUMA (recommended for servers)
+make all          # Build all versions
 make clean        # Remove built files
 make test         # Quick 30-second test run
+```
+
+### Recommended Build
+
+For production use on servers, build with all features:
+
+```bash
+# Install dependencies first
+sudo apt-get install libhwloc-dev libnuma-dev  # Debian/Ubuntu
+# or: sudo yum install hwloc-devel numactl-devel  # RHEL/CentOS
+
+# Build with full features
+make full
+./membench-full -v
 ```
 
 ## Usage
@@ -131,14 +147,24 @@ Results are reported in **nanoseconds per access**, not MB/s.
 
 ## Memory Sizes Tested
 
-The benchmark tests these **total memory** sizes (default: up to 512MB, use `-f` for full sweep):
+The benchmark tests **total memory** sizes starting from an **adaptive minimum** based on detected cache topology:
 
-- **L1 cache range**: 4KB - 64KB
-- **L2 cache range**: 128KB - 1MB  
-- **L3 cache range**: 2MB - 256MB
-- **Main memory**: 512MB - 128GB (with `-f` flag)
+- **Minimum size**: L1_cache × num_CPUs (e.g., 48KB × 192 CPUs = 9MB on r8a.48xlarge)
+- **Maximum size**: 512MB (default) or up to 50% of RAM (with `-f` flag)
 
-For each total size, the benchmark tries different thread counts where each thread gets `total_size / threads` buffer. The minimum per-thread buffer is 4KB to avoid measurement overhead.
+### Why Adaptive Minimum?
+
+To measure aggregate system bandwidth (not per-core), we need enough total memory so each thread can have a meaningful buffer. The formula `L1 × num_CPUs` ensures:
+
+- On 16-core system (48KB L1): minimum = 768KB → can use 16 threads × 48KB each
+- On 192-core system (48KB L1): minimum = 9MB → can use 192 threads × 48KB each
+
+This ensures bandwidth measurements scale properly with core count.
+
+### Cache Detection
+
+With hwloc (recommended), cache sizes are detected automatically on any platform.
+Without hwloc, the benchmark parses `/sys/devices/system/cpu/*/cache/` (Linux only).
 
 ## Thread Scaling and Total Memory Model
 
@@ -246,20 +272,32 @@ Typical modern systems:
 ## Dependencies
 
 - **Required**: POSIX threads (pthread), C11 compiler
+- **Recommended**: libhwloc for portable cache topology detection
 - **Optional**: libnuma for NUMA support
 
 ### Installing Dependencies
 
 ```bash
 # Debian/Ubuntu
-apt-get install build-essential libnuma-dev
+apt-get install build-essential libhwloc-dev libnuma-dev
 
-# RHEL/CentOS
-yum install gcc make numactl-devel
+# RHEL/CentOS/Fedora
+yum install gcc make hwloc-devel numactl-devel
 
-# macOS (no NUMA support)
+# macOS (hwloc only, no NUMA)
+brew install hwloc
 xcode-select --install
 ```
+
+### What Each Dependency Provides
+
+| Library | Purpose | Platforms |
+|---------|---------|-----------|
+| **hwloc** | Cache topology detection (L1/L2/L3 sizes) | Linux, macOS, Windows, BSD |
+| **libnuma** | NUMA-aware memory allocation | Linux only |
+
+Without hwloc, the benchmark falls back to parsing `/sys/devices/system/cpu/*/cache/` (Linux only).
+Without libnuma, memory is allocated without NUMA awareness (may underperform on multi-socket systems).
 
 ## License
 
