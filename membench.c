@@ -890,7 +890,12 @@ static void print_result(const result_t *r) {
  *   4 threads × 256KB buffer = 1MB total
  *   etc.
  * 
- * This ensures size_kb in output represents actual total memory footprint.
+ * For COPY operations, total_size includes BOTH src and dst buffers:
+ *   1 thread  × 512KB src + 512KB dst = 1MB total
+ *   2 threads × 256KB src + 256KB dst = 1MB total
+ * 
+ * This ensures size_kb in output represents actual total memory footprint
+ * consistently across all operations.
  */
 static result_t find_best_config(size_t total_size, operation_t op, 
                                  int *thread_counts, int tc_count) {
@@ -904,13 +909,18 @@ static result_t find_best_config(size_t total_size, operation_t op,
         return best;
     }
     
+    /* For copy: total_size is split between src and dst buffers
+     * So effective_size is what we divide among threads for each buffer */
+    int bufs_per_op = (op == OP_COPY) ? 2 : 1;
+    size_t effective_size = total_size / bufs_per_op;
+    
     /* Try different thread counts where total memory stays constant */
     for (int i = 0; i < tc_count; i++) {
         int nthreads = thread_counts[i];
         if (nthreads < 1) continue;
         
         /* Calculate per-thread buffer size */
-        size_t per_thread_size = total_size / nthreads;
+        size_t per_thread_size = effective_size / nthreads;
         
         /* Skip if per-thread buffer would be too small */
         if (per_thread_size < MIN_PER_THREAD_SIZE) {
@@ -918,13 +928,12 @@ static result_t find_best_config(size_t total_size, operation_t op,
         }
         
         /* Skip if doesn't divide evenly (to keep total exact) */
-        if (per_thread_size * nthreads != total_size) {
+        if (per_thread_size * nthreads != effective_size) {
             continue;
         }
         
-        /* Check memory limit (for copy, need 2 buffers per thread) */
-        int bufs_per_thread = (op == OP_COPY) ? 2 : 1;
-        size_t memory_needed = per_thread_size * nthreads * bufs_per_thread;
+        /* Check memory limit */
+        size_t memory_needed = per_thread_size * nthreads * bufs_per_op;
         if (memory_needed > g_total_memory / 4) {
             continue;
         }
@@ -940,9 +949,10 @@ static result_t find_best_config(size_t total_size, operation_t op,
         }
     }
     
-    /* If no valid configuration found, try single thread with full size */
+    /* If no valid configuration found, try single thread */
     if (best.bandwidth_mb_s == 0) {
-        best = run_benchmark(total_size, op, 1);
+        size_t single_thread_size = effective_size;
+        best = run_benchmark(single_thread_size, op, 1);
         best.size = total_size;
     }
     

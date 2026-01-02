@@ -141,11 +141,14 @@ For each total size, the benchmark tries different thread counts where each thre
 For each **total memory size**, the benchmark tries different thread/buffer configurations while keeping the total memory footprint constant:
 
 ```
-Example for 1MB total:
+Example for 1MB total (read/write):
   1 thread  × 1MB buffer   = 1MB total
   2 threads × 512KB buffer = 1MB total  
   4 threads × 256KB buffer = 1MB total
-  16 threads × 64KB buffer = 1MB total
+
+Example for 1MB total (copy - needs src + dst):
+  1 thread  × 512KB src + 512KB dst = 1MB total
+  2 threads × 256KB src + 256KB dst = 1MB total
 ```
 
 The benchmark finds the optimal configuration and reports:
