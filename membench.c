@@ -140,6 +140,7 @@ static pthread_barrier_t g_barrier;
 static volatile int g_running = 1;
 static int g_verbose = 0;
 static int g_full_sweep = 0;      /* If 1, test all sizes up to max; if 0, stop early when converged */
+static size_t g_single_size = 0;  /* If > 0, test only this size (in bytes) */
 static int g_num_cpus = 0;
 static int g_numa_nodes = 0;
 static size_t g_total_memory = 0;
@@ -946,10 +947,41 @@ static result_t find_best_threads(size_t size, operation_t op,
 static void run_all_benchmarks(void) {
     double start_time = get_time();
     
-    /* Get sizes and thread counts */
-    int size_count, tc_count;
-    size_t *sizes = get_sizes(&size_count);
+    /* Get thread counts */
+    int tc_count;
     int *thread_counts = get_thread_counts(&tc_count);
+    
+    /* Single size mode: test only the specified size */
+    if (g_single_size > 0) {
+        if (g_verbose) {
+            fprintf(stderr, "Testing single size: %zu KB, up to %d thread configurations\n",
+                    g_single_size / 1024, tc_count);
+        }
+        
+        print_csv_header();
+        
+        for (int op = 0; op < 4 && g_running; op++) {
+            result_t best = find_best_threads(g_single_size, (operation_t)op, 
+                                             thread_counts, tc_count);
+            
+            if (best.bandwidth_mb_s > 0 || best.latency_ns > 0) {
+                print_result(&best);
+                fflush(stdout);
+            }
+        }
+        
+        free(thread_counts);
+        
+        if (g_verbose) {
+            double total = get_time() - start_time;
+            fprintf(stderr, "Total runtime: %.1f seconds\n", total);
+        }
+        return;
+    }
+    
+    /* Normal mode: test all sizes */
+    int size_count;
+    size_t *sizes = get_sizes(&size_count);
     
     /* Determine max test size */
     size_t max_test_size = g_full_sweep ? sizes[size_count-1] : DEFAULT_MAX_TEST_SIZE;
@@ -1018,12 +1050,13 @@ static void usage(const char *prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h          Show this help\n");
     fprintf(stderr, "  -v          Verbose output (to stderr)\n");
+    fprintf(stderr, "  -s SIZE_KB  Test only this size (in KB), e.g. -s 1024 for 1MB\n");
     fprintf(stderr, "  -f          Full sweep (test all sizes up to 50%% RAM)\n");
     fprintf(stderr, "              Default: test up to 512 MB (enough for main memory BW)\n");
     fprintf(stderr, "  -t SECONDS  Maximum runtime (default: %.0f)\n", (double)DEFAULT_MAX_RUNTIME);
     fprintf(stderr, "\n");
     fprintf(stderr, "Output: CSV to stdout with columns:\n");
-    fprintf(stderr, "  size_bytes     - Memory size tested\n");
+    fprintf(stderr, "  size_kb        - Memory size tested (KB)\n");
     fprintf(stderr, "  operation      - read, write, copy, or latency\n");
     fprintf(stderr, "  bandwidth_mb_s - Bandwidth in MB/s (0 for latency test)\n");
     fprintf(stderr, "  latency_ns     - Memory latency in nanoseconds (0 for bandwidth tests)\n");
@@ -1040,7 +1073,7 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     int opt;
     
-    while ((opt = getopt(argc, argv, "hvft:")) != -1) {
+    while ((opt = getopt(argc, argv, "hvfs:t:")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -1051,6 +1084,15 @@ int main(int argc, char *argv[]) {
             case 'f':
                 g_full_sweep = 1;
                 break;
+            case 's': {
+                long size_kb = atol(optarg);
+                if (size_kb <= 0) {
+                    fprintf(stderr, "Invalid size: %s\n", optarg);
+                    return 1;
+                }
+                g_single_size = (size_t)size_kb * 1024;  /* Convert KB to bytes */
+                break;
+            }
             case 't':
                 g_max_runtime = atof(optarg);
                 if (g_max_runtime <= 0) {
