@@ -879,66 +879,71 @@ static void print_result(const result_t *r) {
     }
 }
 
-/* Find best thread count for a given size and operation */
-static result_t find_best_threads(size_t size, operation_t op, 
-                                  int *thread_counts, int tc_count) {
+/* Minimum per-thread buffer size (below this, overhead dominates) */
+#define MIN_PER_THREAD_SIZE (4 * 1024)  /* 4 KB */
+
+/* Find best thread/buffer configuration for a given TOTAL memory size.
+ * 
+ * For total_size = 1MB, we try:
+ *   1 thread  × 1MB buffer   = 1MB total
+ *   2 threads × 512KB buffer = 1MB total
+ *   4 threads × 256KB buffer = 1MB total
+ *   etc.
+ * 
+ * This ensures size_kb in output represents actual total memory footprint.
+ */
+static result_t find_best_config(size_t total_size, operation_t op, 
+                                 int *thread_counts, int tc_count) {
     result_t best = {0};
-    best.size = size;
+    best.size = total_size;
     best.op = op;
     
-    /* Limit threads based on total memory needed (size * threads * buffers_per_thread) */
-    /* Use at most 25% of available memory for this test */
-    size_t max_memory = g_total_memory / 4;
-    int bufs_per_thread = (op == OP_COPY) ? 2 : 1;
-    int max_threads_for_memory = (int)(max_memory / (size * bufs_per_thread));
-    if (max_threads_for_memory < 1) max_threads_for_memory = 1;
-    if (max_threads_for_memory > g_num_cpus * 2) max_threads_for_memory = g_num_cpus * 2;
-    
-    /* Find effective thread count limit */
-    int effective_tc_count = 0;
-    for (int i = 0; i < tc_count; i++) {
-        if (thread_counts[i] <= max_threads_for_memory) {
-            effective_tc_count = i + 1;
-        }
-    }
-    if (effective_tc_count < 1) effective_tc_count = 1;
-    
-    /* For latency test: single-thread is usually best (lowest latency).
-     * Also, latency doesn't benefit from more threads - it's about measuring
-     * memory access latency, not aggregate bandwidth. */
+    /* For latency test: single-thread with full buffer size */
     if (op == OP_LATENCY) {
-        best = run_benchmark(size, op, 1);
+        best = run_benchmark(total_size, op, 1);
         return best;
     }
     
-    /* Use adaptive search: try key thread counts first */
-    int key_counts[] = {1, g_num_cpus / 4, g_num_cpus / 2, g_num_cpus, g_num_cpus * 2, 0};
-    for (int k = 0; key_counts[k] != 0; k++) {
-        int tc = key_counts[k];
-        if (tc < 1) tc = 1;
-        if (tc > max_threads_for_memory) continue;
+    /* Try different thread counts where total memory stays constant */
+    for (int i = 0; i < tc_count; i++) {
+        int nthreads = thread_counts[i];
+        if (nthreads < 1) continue;
         
-        result_t r = run_benchmark(size, op, tc);
+        /* Calculate per-thread buffer size */
+        size_t per_thread_size = total_size / nthreads;
+        
+        /* Skip if per-thread buffer would be too small */
+        if (per_thread_size < MIN_PER_THREAD_SIZE) {
+            continue;
+        }
+        
+        /* Skip if doesn't divide evenly (to keep total exact) */
+        if (per_thread_size * nthreads != total_size) {
+            continue;
+        }
+        
+        /* Check memory limit (for copy, need 2 buffers per thread) */
+        int bufs_per_thread = (op == OP_COPY) ? 2 : 1;
+        size_t memory_needed = per_thread_size * nthreads * bufs_per_thread;
+        if (memory_needed > g_total_memory / 4) {
+            continue;
+        }
+        
+        /* Run benchmark with this configuration */
+        result_t r = run_benchmark(per_thread_size, op, nthreads);
+        
+        /* Store total size (not per-thread) for reporting */
+        r.size = total_size;
+        
         if (r.bandwidth_mb_s > best.bandwidth_mb_s) {
             best = r;
         }
     }
     
-    /* Search around best thread count for refinement */
-    if (best.threads > 0) {
-        int best_threads = best.threads;
-        for (int i = 0; i < effective_tc_count; i++) {
-            int tc = thread_counts[i];
-            if (tc == best_threads) continue;
-            
-            /* Test neighbors of best (within 2x range) */
-            if (tc >= best_threads / 2 && tc <= best_threads * 2) {
-                result_t r = run_benchmark(size, op, tc);
-                if (r.bandwidth_mb_s > best.bandwidth_mb_s) {
-                    best = r;
-                }
-            }
-        }
+    /* If no valid configuration found, try single thread with full size */
+    if (best.bandwidth_mb_s == 0) {
+        best = run_benchmark(total_size, op, 1);
+        best.size = total_size;
     }
     
     return best;
@@ -954,15 +959,15 @@ static void run_all_benchmarks(void) {
     /* Single size mode: test only the specified size */
     if (g_single_size > 0) {
         if (g_verbose) {
-            fprintf(stderr, "Testing single size: %zu KB, up to %d thread configurations\n",
-                    g_single_size / 1024, tc_count);
+            fprintf(stderr, "Testing total size: %zu KB with various thread/buffer configs\n",
+                    g_single_size / 1024);
         }
         
         print_csv_header();
         
         for (int op = 0; op < 4 && g_running; op++) {
-            result_t best = find_best_threads(g_single_size, (operation_t)op, 
-                                             thread_counts, tc_count);
+            result_t best = find_best_config(g_single_size, (operation_t)op, 
+                                            thread_counts, tc_count);
             
             if (best.bandwidth_mb_s > 0 || best.latency_ns > 0) {
                 print_result(&best);
@@ -1011,7 +1016,7 @@ static void run_all_benchmarks(void) {
         }
         
         for (int op = 0; op < 4 && g_running; op++) {
-            result_t best = find_best_threads(size, (operation_t)op, 
+            result_t best = find_best_config(size, (operation_t)op, 
                                              thread_counts, tc_count);
             
             if (best.bandwidth_mb_s > 0 || best.latency_ns > 0) {

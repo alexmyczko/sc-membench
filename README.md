@@ -8,7 +8,8 @@ A portable, multi-platform memory bandwidth benchmark designed for comprehensive
 - **Multiple operations**: Measures read, write, copy bandwidth + memory latency
 - **NUMA-aware**: Automatically handles NUMA systems (optional, works on non-NUMA too)
 - **Cache analysis**: Sweeps through L1, L2, L3 cache sizes and main memory
-- **Thread scaling**: Finds optimal thread count for peak bandwidth
+- **Total memory model**: Reports actual total memory footprint, not per-thread size
+- **Thread optimization**: Finds optimal thread/buffer configuration for each total size
 - **Latency measurement**: True memory latency using pointer chasing
 - **CSV output**: Machine-readable output for analysis
 
@@ -49,6 +50,9 @@ Usage: ./membench [options]
 Options:
   -h          Show help
   -v          Verbose output (to stderr)
+  -s SIZE_KB  Test only this total size (in KB), e.g. -s 1024 for 1MB
+  -f          Full sweep (test all sizes up to 50% RAM)
+              Default: test up to 512 MB
   -t SECONDS  Maximum runtime (default: 600)
 ```
 
@@ -58,7 +62,7 @@ CSV output to stdout with columns:
 
 | Column | Description |
 |--------|-------------|
-| `size_bytes` | Memory buffer size tested (bytes) |
+| `size_kb` | **Total** memory footprint tested (KB) |
 | `operation` | Operation type: `read`, `write`, `copy`, or `latency` |
 | `bandwidth_mb_s` | Bandwidth achieved (MB/s), 0 for latency test |
 | `latency_ns` | Memory latency (nanoseconds), 0 for bandwidth tests |
@@ -69,25 +73,22 @@ CSV output to stdout with columns:
 ### Example Output
 
 ```csv
-size_bytes,operation,bandwidth_mb_s,latency_ns,threads,iterations,elapsed_s
-1024,read,45678.90,0,1,1000000,0.012345
-1024,write,34567.89,0,1,1000000,0.015678
-1024,copy,56789.01,0,2,500000,0.018901
-1024,latency,0,1.23,1,1000000,0.012345
-...
-1073741824,read,98765.43,0,64,10,0.109876
-1073741824,write,87654.32,0,64,10,0.123456
-1073741824,copy,76543.21,0,128,10,0.145678
-1073741824,latency,0,85.67,1,10,0.109876
+size_kb,operation,bandwidth_mb_s,latency_ns,threads,iterations,elapsed_s
+4,read,8000000.00,0,16,10000000,0.08
+4,write,4000000.00,0,16,6000000,0.10
+16384,read,2200000.00,0,16,100000,0.12
+16384,write,3000000.00,0,32,150000,0.16
+1048576,read,115000.00,0,32,275,2.45
+1048576,write,68000.00,0,32,188,2.83
 ```
 
 ## Operations Explained
 
 ### Read (`read`)
-Reads all 64-bit words from the buffer and sums them. This measures pure read bandwidth.
+Reads all 64-bit words from the buffer using XOR (faster than addition, no carry chains). This measures pure read bandwidth.
 
 ```c
-sum += buffer[i];  // For all elements
+checksum ^= buffer[i];  // For all elements, using 8 independent accumulators
 ```
 
 ### Write (`write`)
@@ -98,11 +99,13 @@ buffer[i] = pattern;  // For all elements
 ```
 
 ### Copy (`copy`)
-Copies data from source to destination buffer. This measures read+write bandwidth combined.
+Copies data from source to destination buffer. Reports bandwidth as `buffer_size / time` (matching lmbench's approach), not `2 × buffer_size / time`.
 
 ```c
 dst[i] = src[i];  // For all elements
 ```
+
+**Note:** Copy bandwidth is typically lower than read or write alone because it performs both operations. The reported bandwidth represents the buffer size traversed, not total bytes moved (read + write).
 
 ### Latency (`latency`)
 Measures true memory access latency using **pointer chasing**. Each memory access depends on the previous one, preventing CPU pipelining and prefetching.
@@ -124,24 +127,47 @@ Results are reported in **nanoseconds per access**, not MB/s.
 
 ## Memory Sizes Tested
 
-The benchmark automatically tests these sizes (up to 50% of available RAM):
+The benchmark tests these **total memory** sizes (default: up to 512MB, use `-f` for full sweep):
 
-- **L1 cache range**: 1KB - 64KB
-- **L2 cache range**: 96KB - 1MB
-- **L3 cache range**: 1.5MB - 256MB
-- **Main memory**: 384MB - 128GB+
+- **L1 cache range**: 4KB - 64KB
+- **L2 cache range**: 128KB - 1MB  
+- **L3 cache range**: 2MB - 256MB
+- **Main memory**: 512MB - 128GB (with `-f` flag)
 
-## Thread Scaling
+For each total size, the benchmark tries different thread counts where each thread gets `total_size / threads` buffer. The minimum per-thread buffer is 4KB to avoid measurement overhead.
 
-For each size and operation, the benchmark:
-1. Tries various thread counts (1, 2, 4, 8, 16, 32, ... up to 2×nproc)
-2. Reports the thread count that achieved the best bandwidth
-3. Uses early termination when bandwidth clearly drops
+## Thread Scaling and Total Memory Model
 
-This helps identify:
-- Optimal thread count for different memory regions
-- NUMA effects (where more threads across nodes help)
-- Contention (where too many threads hurt performance)
+For each **total memory size**, the benchmark tries different thread/buffer configurations while keeping the total memory footprint constant:
+
+```
+Example for 1MB total:
+  1 thread  × 1MB buffer   = 1MB total
+  2 threads × 512KB buffer = 1MB total  
+  4 threads × 256KB buffer = 1MB total
+  16 threads × 64KB buffer = 1MB total
+```
+
+The benchmark finds the optimal configuration and reports:
+- `size_kb`: The total memory footprint (not per-thread)
+- `threads`: The winning thread count
+- `bandwidth_mb_s`: The best bandwidth achieved
+
+This approach ensures that **size_kb values are directly comparable** - a 1MB test and a 16GB test both represent actual total memory usage, making the results meaningful for comparing cache vs main memory performance.
+
+### Why This Matters
+
+With per-thread buffers, more threads means more total memory. If we reported per-thread size:
+- "1MB" with 24 threads = 24MB actual memory
+- "16GB" with 1 thread = 16GB actual memory
+
+These wouldn't be comparable! By keeping total memory constant and varying thread/buffer splits, we find the true optimal configuration for each memory footprint.
+
+### What the Benchmark Discovers
+
+- **Small sizes (cache-resident)**: Many threads with small buffers often wins
+- **Large sizes (main memory)**: Fewer threads with larger buffers may be optimal
+- **NUMA systems**: Thread distribution across nodes affects performance
 
 ## NUMA Support
 
@@ -156,16 +182,19 @@ When compiled with `-DUSE_NUMA` and linked with `-lnuma`:
 
 ### Bandwidth (bw_mem)
 
-sc-membench measures **actual data bandwidth** while lmbench's `bw_mem rd` uses strided access:
-
 | Aspect | sc-membench | lmbench bw_mem |
 |--------|-------------|----------------|
-| **Parallelism model** | Threads (shared memory) | Processes (fork) |
+| **Parallelism model** | Threads | Processes (fork) |
 | **Buffer allocation** | Each thread has own buffer | Each process has own buffer |
+| **Size reporting** | Total memory footprint | Per-process buffer size |
 | **Read operation** | Reads 100% of data | `rd` reads 25% (strided) |
-| **Bandwidth metric** | Actual bytes transferred | Buffer size traversed |
+| **Copy reporting** | Buffer size / time | Buffer size / time |
 
-For small cache-resident sizes, `bw_mem rd` reports ~4x higher bandwidth because it only reads 25% of data but reports the full buffer size.
+**Key differences:**
+
+1. **Size meaning**: sc-membench's `size_kb` is total memory used; bw_mem's size is per-process
+2. **Read operation**: bw_mem `rd` uses strided access (reads 25% of data), reporting ~4x higher apparent bandwidth
+3. **Thread optimization**: sc-membench finds optimal thread/buffer configuration for each total size
 
 ### Latency (lat_mem_rd)
 
@@ -187,11 +216,11 @@ Look for bandwidth drops and latency increases as sizes exceed cache levels:
 - Another change at L2 boundary (256KB-1MB typically)
 - Final change at L3 boundary (8-64MB typically)
 
-### Thread Scaling
-- Small sizes: 1-4 threads often optimal (cache-resident, low contention)
-- Large sizes: Many threads needed to saturate memory bandwidth
-- NUMA systems: Need threads on all nodes for full bandwidth
-- Latency test: Always uses 1 thread (latency doesn't benefit from parallelism)
+### Thread Configuration
+- Small total sizes: More threads with small buffers (fits in per-core cache)
+- Large total sizes: Fewer threads with larger buffers (memory-bound)
+- NUMA systems: Thread distribution across nodes affects performance
+- Latency test: Always uses 1 thread with full buffer size
 
 ### Bandwidth Values
 Typical modern systems:
