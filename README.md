@@ -125,6 +125,10 @@ The buffer is initialized as a linked list of pointers in **randomized order** t
 
 Results are reported in **nanoseconds per access**, not MB/s.
 
+**Large L3 cache support**: The latency test uses buffers up to 2GB (or 25% of RAM) to correctly measure DRAM latency even on processors with huge L3 caches like AMD EPYC 9754 (1.1GB L3 with 3D V-Cache).
+
+**Adaptive early termination**: For buffer sizes >1.5GB in series mode, when DRAM latency is detected (>50ns), the benchmark uses adaptive termination to stop early once measurements stabilize. This helps on systems with both large caches and slower DRAM.
+
 ## Memory Sizes Tested
 
 The benchmark tests these **total memory** sizes (default: up to 512MB, use `-f` for full sweep):
@@ -236,8 +240,8 @@ Typical modern systems:
 Typical modern systems:
 - L1 cache: 1-2 ns
 - L2 cache: 3-10 ns
-- L3 cache: 10-30 ns
-- Main memory: 60-120 ns (DDR4/DDR5)
+- L3 cache: 10-40 ns (larger/3D V-Cache may be higher)
+- Main memory: 25-50 ns (fast DDR5) to 60-120 ns (DDR4)
 
 ## Dependencies
 

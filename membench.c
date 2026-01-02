@@ -150,6 +150,10 @@ static size_t g_total_memory = 0;
 #define DEFAULT_MAX_TEST_SIZE (512UL * 1024 * 1024)  /* 512 MB */
 static double g_max_runtime = DEFAULT_MAX_RUNTIME;
 
+/* Adaptive latency tracking - used for early termination in series tests */
+static double g_prev_latency_ns = 0;
+static size_t g_prev_latency_size = 0;
+
 /* ============================================================================
  * Timing
  * ============================================================================ */
@@ -317,6 +321,135 @@ void* mem_latency_chase(void *start, size_t accesses) {
     }
     
     return p;
+}
+
+/* Adaptive latency measurement with early termination for series tests.
+ * 
+ * Strategy:
+ * 1. First, traverse at least prev_size worth of accesses (warm up past known cache levels)
+ * 2. Then measure in chunks, computing moving average latency
+ * 3. Stop when latency has stabilized (plateau detected)
+ * 
+ * Returns: measured latency in nanoseconds, updates total_accesses with actual count
+ */
+static double mem_latency_adaptive(void *start, size_t buf_count, 
+                                   size_t prev_size, double prev_latency_ns,
+                                   size_t *total_accesses) {
+    void **p = (void **)start;
+    
+    /* Minimum accesses: at least traverse past the previous buffer size */
+    size_t min_accesses = prev_size / sizeof(void*);
+    if (min_accesses < 1000) min_accesses = 1000;
+    
+    /* Chunk size for measurement (~100K accesses per chunk, ~10ms at 100ns latency) */
+    size_t chunk_size = 100000;
+    
+    /* Maximum accesses (traverse entire buffer 3 times) */
+    size_t max_accesses = buf_count * 3;
+    if (max_accesses < min_accesses * 2) max_accesses = min_accesses * 2;
+    
+    /* Convergence parameters */
+    #define LATENCY_WINDOW 5
+    double recent_latencies[LATENCY_WINDOW] = {0};
+    int window_idx = 0;
+    int stable_count = 0;
+    double converged_latency = 0;
+    
+    /* Do minimum accesses first (no timing, just warm up) */
+    double warmup_start = get_time();
+    size_t warmup_accesses = min_accesses;
+    while (warmup_accesses >= 8) {
+        p = (void **)*p;
+        p = (void **)*p;
+        p = (void **)*p;
+        p = (void **)*p;
+        p = (void **)*p;
+        p = (void **)*p;
+        p = (void **)*p;
+        p = (void **)*p;
+        warmup_accesses -= 8;
+    }
+    while (warmup_accesses > 0) {
+        p = (void **)*p;
+        warmup_accesses--;
+    }
+    double warmup_end = get_time();
+    double warmup_latency = (warmup_end - warmup_start) * 1e9 / min_accesses;
+    
+    /* Initialize window with warmup latency */
+    for (int i = 0; i < LATENCY_WINDOW; i++) {
+        recent_latencies[i] = warmup_latency;
+    }
+    
+    /* Now measure in chunks, checking for convergence */
+    size_t accesses_done = min_accesses;
+    
+    while (accesses_done < max_accesses) {
+        double chunk_start = get_time();
+        
+        /* Chase for one chunk */
+        size_t remaining = chunk_size;
+        while (remaining >= 8) {
+            p = (void **)*p;
+            p = (void **)*p;
+            p = (void **)*p;
+            p = (void **)*p;
+            p = (void **)*p;
+            p = (void **)*p;
+            p = (void **)*p;
+            p = (void **)*p;
+            remaining -= 8;
+        }
+        while (remaining > 0) {
+            p = (void **)*p;
+            remaining--;
+        }
+        
+        double chunk_end = get_time();
+        double chunk_latency = (chunk_end - chunk_start) * 1e9 / chunk_size;
+        accesses_done += chunk_size;
+        
+        /* Update sliding window */
+        recent_latencies[window_idx] = chunk_latency;
+        window_idx = (window_idx + 1) % LATENCY_WINDOW;
+        
+        /* Compute average and check for stability */
+        double avg = 0, min_lat = 1e12, max_lat = 0;
+        for (int i = 0; i < LATENCY_WINDOW; i++) {
+            avg += recent_latencies[i];
+            if (recent_latencies[i] < min_lat) min_lat = recent_latencies[i];
+            if (recent_latencies[i] > max_lat) max_lat = recent_latencies[i];
+        }
+        avg /= LATENCY_WINDOW;
+        
+        /* Check if latency is stable (within 10% spread) and significantly
+         * different from previous level (or we've done enough) */
+        double spread = (max_lat - min_lat) / avg;
+        int is_stable = (spread < 0.10);
+        
+        /* Also check if we've diverged from previous latency (new cache level) */
+        int diverged_from_prev = (prev_latency_ns > 0 && avg > prev_latency_ns * 1.3);
+        
+        if (is_stable) {
+            stable_count++;
+            converged_latency = avg;
+            
+            /* Need 3 stable chunks AND either diverged or done enough */
+            if (stable_count >= 3 && (diverged_from_prev || accesses_done >= min_accesses * 3)) {
+                break;
+            }
+        } else {
+            stable_count = 0;
+        }
+    }
+    
+    /* Store final pointer to prevent optimization */
+    g_sink = (uint64_t)(uintptr_t)p;
+    
+    *total_accesses = accesses_done;
+    return (converged_latency > 0) ? converged_latency : warmup_latency;
+    
+    #undef LATENCY_WINDOW
 }
 
 /* ============================================================================
@@ -882,6 +1015,12 @@ static void print_result(const result_t *r) {
 /* Minimum per-thread buffer size (below this, overhead dominates) */
 #define MIN_PER_THREAD_SIZE (4 * 1024)  /* 4 KB */
 
+/* Maximum buffer size for latency test.
+ * Must exceed largest L3 caches to measure true DRAM latency.
+ * AMD EPYC 9754 (Genoa-X) has 1.1GB L3 cache, so we need > 1.1GB.
+ * 2GB should cover any current processor. */
+#define MAX_LATENCY_SIZE (2UL * 1024 * 1024 * 1024)  /* 2 GB */
+
 /* Find best thread/buffer configuration for a given TOTAL memory size.
  * 
  * For total_size = 1MB, we try:
@@ -903,9 +1042,69 @@ static result_t find_best_config(size_t total_size, operation_t op,
     best.size = total_size;
     best.op = op;
     
-    /* For latency test: single-thread with full buffer size */
+    /* For latency test: single-thread, cap buffer size.
+     * Need buffer larger than L3 cache to measure true DRAM latency.
+     * Cap at MAX_LATENCY_SIZE (2GB) or 25% of available memory, whichever is smaller. */
     if (op == OP_LATENCY) {
-        best = run_benchmark(total_size, op, 1);
+        size_t max_latency = MAX_LATENCY_SIZE;
+        if (g_total_memory / 4 < max_latency) {
+            max_latency = g_total_memory / 4;
+        }
+        size_t latency_size = (total_size > max_latency) ? max_latency : total_size;
+        
+        /* Use adaptive early termination for series tests (not single-size mode)
+         * when:
+         * - We have previous latency data
+         * - Current size is larger than previous
+         * - Current size is > 1.5GB (safely past even AMD EPYC 9754's 1.1GB L3)
+         * - Previous latency indicates we're already in DRAM territory (> 50ns)
+         *   Note: L3 latency is typically 10-40ns, DRAM is 60-120ns
+         */
+        int in_dram_region = (g_prev_latency_ns > 50.0);
+        int past_l3_cache = (latency_size > 1536UL * 1024 * 1024);  /* 1.5 GB */
+        
+        if (g_single_size == 0 && g_prev_latency_ns > 0 && 
+            latency_size > g_prev_latency_size && past_l3_cache && in_dram_region) {
+            /* Adaptive latency measurement */
+            void *buf = alloc_buffer(latency_size);
+            if (buf) {
+                size_t count = latency_size / sizeof(void*);
+                if (count < 2) count = 2;
+                init_pointer_chain((void**)buf, count);
+                
+                size_t actual_accesses = 0;
+                double start = get_time();
+                double latency = mem_latency_adaptive(buf, count,
+                                                      g_prev_latency_size, g_prev_latency_ns,
+                                                      &actual_accesses);
+                double elapsed = get_time() - start;
+                
+                free_buffer(buf, latency_size);
+                
+                best.size = total_size;
+                best.op = op;
+                best.threads = 1;
+                best.latency_ns = latency;
+                best.elapsed_s = elapsed;
+                best.iterations = (int)(actual_accesses / count);
+                if (best.iterations < 1) best.iterations = 1;
+                
+                /* Update tracking for next test */
+                g_prev_latency_ns = latency;
+                g_prev_latency_size = latency_size;
+                
+                return best;
+            }
+        }
+        
+        /* Standard latency measurement (for first test or single-size mode) */
+        best = run_benchmark(latency_size, op, 1);
+        best.size = total_size;  /* Report requested size, not capped size */
+        
+        /* Update tracking for next test */
+        g_prev_latency_ns = best.latency_ns;
+        g_prev_latency_size = latency_size;
+        
         return best;
     }
     
@@ -961,6 +1160,10 @@ static result_t find_best_config(size_t total_size, operation_t op,
 
 static void run_all_benchmarks(void) {
     double start_time = get_time();
+    
+    /* Reset adaptive latency tracking for this run */
+    g_prev_latency_ns = 0;
+    g_prev_latency_size = 0;
     
     /* Get thread counts */
     int tc_count;
