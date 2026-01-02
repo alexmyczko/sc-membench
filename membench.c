@@ -644,9 +644,9 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
                 result.latency_ns = (work.elapsed * 1e9) / total_accesses;
             }
         } else {
-            /* Bandwidth = (size per thread * threads * iterations) / time */
+            /* Bandwidth = (size per thread * threads * iterations) / time
+             * Note: for copy, we report buffer size (not 2x) to match bw_mem */
             size_t bytes_transferred = size * iterations;
-            if (op == OP_COPY) bytes_transferred *= 2;
             
             if (work.elapsed > 0) {
                 result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / work.elapsed;
@@ -759,9 +759,9 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
         }
     } else {
         /* Bandwidth = (size per thread * threads * iterations) / time 
-         * This gives aggregate bandwidth across all threads */
+         * This gives aggregate bandwidth across all threads
+         * Note: for copy, we report buffer size (not 2x) to match bw_mem */
         size_t bytes_transferred = (size_t)size * nthreads * iterations;
-        if (op == OP_COPY) bytes_transferred *= 2;
         
         if (max_elapsed > 0) {
             result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / max_elapsed;
