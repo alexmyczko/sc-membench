@@ -860,19 +860,20 @@ static size_t* get_sizes(int *count) {
 }
 
 static void print_csv_header(void) {
-    printf("size_bytes,operation,bandwidth_mb_s,latency_ns,threads,iterations,elapsed_s\n");
+    printf("size_kb,operation,bandwidth_mb_s,latency_ns,threads,iterations,elapsed_s\n");
 }
 
 static void print_result(const result_t *r) {
+    size_t size_kb = r->size / 1024;
     if (r->op == OP_LATENCY) {
         /* For latency test, bandwidth is 0, latency has value */
         printf("%zu,%s,0,%.2f,%d,%d,%.6f\n",
-               r->size, OP_NAMES[r->op], r->latency_ns,
+               size_kb, OP_NAMES[r->op], r->latency_ns,
                r->threads, r->iterations, r->elapsed_s);
     } else {
         /* For bandwidth tests, latency is 0 */
         printf("%zu,%s,%.2f,0,%d,%d,%.6f\n",
-               r->size, OP_NAMES[r->op], r->bandwidth_mb_s,
+               size_kb, OP_NAMES[r->op], r->bandwidth_mb_s,
                r->threads, r->iterations, r->elapsed_s);
     }
 }
