@@ -512,10 +512,6 @@ static void run_single_thread(thread_work_t *work) {
     work->checksum = checksum;
 }
 
-/* Forward declaration for NUMA support */
-#ifdef USE_NUMA
-static void distribute_memory(void *buf, size_t size);
-#endif
 
 static void* thread_worker(void *arg) {
     thread_work_t *work = (thread_work_t *)arg;
@@ -525,15 +521,33 @@ static void* thread_worker(void *arg) {
     uint64_t checksum = 0;
     int iterations = work->iterations;
     
-#ifdef USE_NUMA
-    /* Bind to NUMA node if specified */
-    if (work->numa_node >= 0 && numa_available() >= 0) {
-        numa_run_on_node(work->numa_node);
+    /* Pin thread to specific CPU for consistent results.
+     * This prevents the OS scheduler from moving threads between cores,
+     * which causes huge variability in benchmark results.
+     * 
+     * NOTE: We do NOT call numa_run_on_node() because it would OVERRIDE
+     * the CPU pinning and allow the thread to run on any CPU in that node.
+     * CPU pinning is more precise and gives better consistency. */
+    if (work->thread_id >= 0 && work->thread_id < g_num_cpus) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(work->thread_id, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     }
     
-    /* Distribute memory for this thread's buffer */
-    distribute_memory(src, size);
-    if (dst) distribute_memory(dst, size);
+#ifdef USE_NUMA
+    /* Allocate memory on the local NUMA node for this CPU.
+     * This ensures memory is close to where it will be accessed. */
+    if (numa_available() >= 0 && g_numa_nodes > 1) {
+        int cpu = work->thread_id;
+        int node = numa_node_of_cpu(cpu);
+        if (node >= 0) {
+            /* Bind memory to the local node */
+            unsigned long nodemask = 1UL << node;
+            mbind(src, size, MPOL_BIND, &nodemask, g_numa_nodes + 1, MPOL_MF_MOVE);
+            if (dst) mbind(dst, size, MPOL_BIND, &nodemask, g_numa_nodes + 1, MPOL_MF_MOVE);
+        }
+    }
 #endif
     
     /* Initialize thread's private buffer (touch all pages) 
@@ -818,18 +832,6 @@ static void init_numa(void) {
 #endif
 }
 
-/* Distribute memory across NUMA nodes (used in thread worker) */
-#ifdef USE_NUMA
-static void distribute_memory(void *buf, size_t size) {
-    if (numa_available() >= 0 && g_numa_nodes > 1) {
-        /* Interleave memory across all nodes */
-        unsigned long nodemask = (1UL << g_numa_nodes) - 1;
-        if (mbind(buf, size, MPOL_INTERLEAVE, &nodemask, g_numa_nodes + 1, 0) < 0) {
-            /* Silently ignore errors */
-        }
-    }
-}
-#endif
 
 /* ============================================================================
  * System info
@@ -1053,7 +1055,7 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
         work[i].checksum = 0;
         work[i].elapsed = 0;
         work[i].thread_id = i;
-        work[i].numa_node = (g_numa_nodes > 1) ? (i % g_numa_nodes) : -1;
+        work[i].numa_node = -1;  /* Not used anymore - we use numa_node_of_cpu() in thread */
     }
     
     /* Launch threads */
@@ -1115,9 +1117,17 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
 /* Run benchmark multiple times and return best result (like lmbench TRIES)
  * For bandwidth: best = highest bandwidth
  * For latency: best = lowest latency
+ * 
+ * First run is a warmup (discarded) to allow CPU frequency to ramp up
+ * and caches to warm. This dramatically reduces result variability.
  */
 static result_t run_benchmark_best(size_t size, operation_t op, int nthreads) {
     result_t best = {0};
+    
+    /* Warmup run - discarded.
+     * This allows: CPU to reach turbo frequency, caches to warm,
+     * thread scheduling to stabilize. Critical for consistent results. */
+    (void)run_benchmark(size, op, nthreads);
     
     for (int try = 0; try < g_benchmark_tries; try++) {
         result_t r = run_benchmark(size, op, nthreads);
