@@ -117,7 +117,8 @@ typedef struct {
     int iterations;         /* Number of iterations */
     uint64_t checksum;      /* Prevent optimization */
     double elapsed;         /* Thread's elapsed time */
-    int thread_id;          /* Thread ID */
+    int thread_id;          /* Logical thread ID (0..nthreads-1) */
+    int cpu_id;             /* Physical CPU ID to pin to */
     int numa_node;          /* NUMA node to bind to (-1 for no binding) */
     int ready;              /* Thread ready flag */
 } thread_work_t;
@@ -144,6 +145,12 @@ static size_t g_single_size = 0;  /* If > 0, test only this size (in bytes) */
 static int g_num_cpus = 0;
 static int g_numa_nodes = 0;
 static size_t g_total_memory = 0;
+
+/* NUMA topology - CPUs per node for balanced thread distribution */
+#define MAX_NUMA_NODES 64
+#define MAX_CPUS_PER_NODE 512
+static int g_cpus_per_node[MAX_NUMA_NODES];           /* Count of CPUs on each node */
+static int g_node_cpus[MAX_NUMA_NODES][MAX_CPUS_PER_NODE];  /* CPU IDs for each node */
 /* Number of times to run each benchmark, taking best result (like lmbench TRIES=11) */
 #define DEFAULT_BENCHMARK_TRIES 3
 static int g_benchmark_tries = DEFAULT_BENCHMARK_TRIES;
@@ -525,21 +532,24 @@ static void* thread_worker(void *arg) {
      * This prevents the OS scheduler from moving threads between cores,
      * which causes huge variability in benchmark results.
      * 
+     * On NUMA systems, threads are distributed evenly across nodes using
+     * get_cpu_for_thread(), so cpu_id is already NUMA-balanced.
+     * 
      * NOTE: We do NOT call numa_run_on_node() because it would OVERRIDE
      * the CPU pinning and allow the thread to run on any CPU in that node.
      * CPU pinning is more precise and gives better consistency. */
-    if (work->thread_id >= 0 && work->thread_id < g_num_cpus) {
+    int cpu = work->cpu_id;
+    if (cpu >= 0 && cpu < g_num_cpus) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(work->thread_id, &cpuset);
+        CPU_SET(cpu, &cpuset);
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     }
     
 #ifdef USE_NUMA
-    /* Allocate memory on the local NUMA node for this CPU.
+    /* Bind memory to the local NUMA node for this CPU.
      * This ensures memory is close to where it will be accessed. */
-    if (numa_available() >= 0 && g_numa_nodes > 1) {
-        int cpu = work->thread_id;
+    if (numa_available() >= 0 && g_numa_nodes > 1 && cpu >= 0) {
         int node = numa_node_of_cpu(cpu);
         if (node >= 0) {
             /* Bind memory to the local node */
@@ -811,6 +821,65 @@ static void cleanup_hwloc(void) {
  * NUMA support
  * ============================================================================ */
 
+static void init_numa_topology(void) {
+    /* Initialize topology arrays */
+    memset(g_cpus_per_node, 0, sizeof(g_cpus_per_node));
+    memset(g_node_cpus, 0, sizeof(g_node_cpus));
+    
+#ifdef USE_NUMA
+    if (numa_available() >= 0 && g_numa_nodes > 1) {
+        /* Build CPU-to-node mapping using libnuma */
+        for (int cpu = 0; cpu < g_num_cpus && cpu < MAX_NUMA_NODES * MAX_CPUS_PER_NODE; cpu++) {
+            int node = numa_node_of_cpu(cpu);
+            if (node >= 0 && node < MAX_NUMA_NODES) {
+                int idx = g_cpus_per_node[node];
+                if (idx < MAX_CPUS_PER_NODE) {
+                    g_node_cpus[node][idx] = cpu;
+                    g_cpus_per_node[node]++;
+                }
+            }
+        }
+        
+        if (g_verbose) {
+            fprintf(stderr, "NUMA topology:\n");
+            for (int node = 0; node < g_numa_nodes; node++) {
+                fprintf(stderr, "  Node %d: %d CPUs (first: %d, last: %d)\n",
+                        node, g_cpus_per_node[node],
+                        g_cpus_per_node[node] > 0 ? g_node_cpus[node][0] : -1,
+                        g_cpus_per_node[node] > 0 ? g_node_cpus[node][g_cpus_per_node[node]-1] : -1);
+            }
+        }
+    } else
+#endif
+    {
+        /* UMA or NUMA not enabled: all CPUs on "node 0" */
+        for (int cpu = 0; cpu < g_num_cpus && cpu < MAX_CPUS_PER_NODE; cpu++) {
+            g_node_cpus[0][cpu] = cpu;
+        }
+        g_cpus_per_node[0] = g_num_cpus < MAX_CPUS_PER_NODE ? g_num_cpus : MAX_CPUS_PER_NODE;
+    }
+}
+
+/* Get CPU for thread i, distributing evenly across NUMA nodes */
+static int get_cpu_for_thread(int thread_id, int num_threads) {
+    if (g_numa_nodes <= 1 || num_threads <= 1) {
+        /* UMA or single thread: use sequential assignment */
+        return thread_id % g_num_cpus;
+    }
+    
+    /* NUMA: distribute threads round-robin across nodes */
+    int node = thread_id % g_numa_nodes;
+    int thread_on_node = thread_id / g_numa_nodes;
+    
+    if (g_cpus_per_node[node] == 0) {
+        /* Fallback if node has no CPUs (shouldn't happen) */
+        return thread_id % g_num_cpus;
+    }
+    
+    int cpu_idx = thread_on_node % g_cpus_per_node[node];
+    return g_node_cpus[node][cpu_idx];
+}
+
 static void init_numa(void) {
 #ifdef USE_NUMA
     if (numa_available() >= 0) {
@@ -830,6 +899,9 @@ static void init_numa(void) {
         fprintf(stderr, "NUMA: disabled (compile with -DUSE_NUMA -lnuma to enable)\n");
     }
 #endif
+    
+    /* Build NUMA topology after detecting nodes */
+    init_numa_topology();
 }
 
 
@@ -1045,7 +1117,7 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
     
     pthread_barrier_init(&g_barrier, NULL, nthreads);
     
-    /* Setup per-thread work */
+    /* Setup per-thread work with NUMA-balanced CPU assignment */
     for (int i = 0; i < nthreads; i++) {
         work[i].src = src_bufs[i];
         work[i].dst = dst_bufs[i];
@@ -1055,7 +1127,8 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
         work[i].checksum = 0;
         work[i].elapsed = 0;
         work[i].thread_id = i;
-        work[i].numa_node = -1;  /* Not used anymore - we use numa_node_of_cpu() in thread */
+        work[i].cpu_id = get_cpu_for_thread(i, nthreads);  /* NUMA-balanced CPU assignment */
+        work[i].numa_node = -1;  /* Not used - memory binding done in thread using cpu_id */
     }
     
     /* Launch threads */
