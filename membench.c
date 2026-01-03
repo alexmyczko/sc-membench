@@ -55,8 +55,8 @@
 /* Maximum iterations per test */
 #define MAX_ITERATIONS 10000000
 
-/* Default total runtime target (seconds) */
-#define DEFAULT_MAX_RUNTIME 600
+/* Default total runtime target (seconds). 0 = unlimited */
+#define DEFAULT_MAX_RUNTIME 0
 
 /* Memory sizes to test (in bytes) - key points to show cache hierarchy
  * ~20 sizes covering L1, L2, L3, and main memory */
@@ -1430,7 +1430,11 @@ static void run_all_benchmarks(void) {
         fprintf(stderr, "Max test size: %.2f MB%s\n", 
                 max_test_size / (1024.0 * 1024.0),
                 g_full_sweep ? " (full sweep)" : " (use -f for full sweep)");
-        fprintf(stderr, "Target runtime: %.0f seconds\n", g_max_runtime);
+        if (g_max_runtime > 0) {
+            fprintf(stderr, "Target runtime: %.0f seconds\n", g_max_runtime);
+        } else {
+            fprintf(stderr, "Target runtime: unlimited\n");
+        }
     }
     
     print_csv_header();
@@ -1453,14 +1457,16 @@ static void run_all_benchmarks(void) {
                 fflush(stdout);
             }
             
-            /* Check time budget */
-            double elapsed = get_time() - start_time;
-            if (elapsed > g_max_runtime) {
-                if (g_verbose) {
-                    fprintf(stderr, "Time limit reached (%.1f s)\n", elapsed);
+            /* Check time budget (0 = unlimited) */
+            if (g_max_runtime > 0) {
+                double elapsed = get_time() - start_time;
+                if (elapsed > g_max_runtime) {
+                    if (g_verbose) {
+                        fprintf(stderr, "Time limit reached (%.1f s)\n", elapsed);
+                    }
+                    g_running = 0;
+                    break;
                 }
-                g_running = 0;
-                break;
             }
         }
     }
@@ -1487,7 +1493,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -s SIZE_KB  Test only this size (in KB), e.g. -s 1024 for 1MB\n");
     fprintf(stderr, "  -f          Full sweep (test all sizes up to 50%% RAM)\n");
     fprintf(stderr, "              Default: test up to 512 MB (enough for main memory BW)\n");
-    fprintf(stderr, "  -t SECONDS  Maximum runtime (default: %.0f)\n", (double)DEFAULT_MAX_RUNTIME);
+    fprintf(stderr, "  -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Output: CSV to stdout with columns:\n");
     fprintf(stderr, "  size_kb        - Memory size tested (KB)\n");
@@ -1529,8 +1535,8 @@ int main(int argc, char *argv[]) {
             }
             case 't':
                 g_max_runtime = atof(optarg);
-                if (g_max_runtime <= 0) {
-                    fprintf(stderr, "Invalid runtime: %s\n", optarg);
+                if (g_max_runtime < 0) {
+                    fprintf(stderr, "Invalid runtime: %s (use 0 for unlimited)\n", optarg);
                     return 1;
                 }
                 break;

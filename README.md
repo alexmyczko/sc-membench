@@ -69,7 +69,7 @@ Options:
   -s SIZE_KB  Test only this total size (in KB), e.g. -s 1024 for 1MB
   -f          Full sweep (test all sizes up to 50% RAM)
               Default: test up to 512 MB
-  -t SECONDS  Maximum runtime (default: 600)
+  -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)
 ```
 
 ## Output Format
