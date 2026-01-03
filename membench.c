@@ -144,6 +144,9 @@ static size_t g_single_size = 0;  /* If > 0, test only this size (in bytes) */
 static int g_num_cpus = 0;
 static int g_numa_nodes = 0;
 static size_t g_total_memory = 0;
+/* Number of times to run each benchmark, taking best result (like lmbench TRIES=11) */
+#define DEFAULT_BENCHMARK_TRIES 3
+static int g_benchmark_tries = DEFAULT_BENCHMARK_TRIES;
 
 /* Default max test size for quick sweep (well past any L3 cache)
  * 512MB is enough to measure main memory bandwidth on any system */
@@ -917,6 +920,7 @@ static int calibrate_iterations(void *src, void *dst, size_t size,
     return iters;
 }
 
+
 /* Run a single benchmark
  * Each thread gets its own buffer (like bw_mem) to measure aggregate system bandwidth
  */
@@ -1106,6 +1110,36 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
     free(dst_bufs);
     
     return result;
+}
+
+/* Run benchmark multiple times and return best result (like lmbench TRIES)
+ * For bandwidth: best = highest bandwidth
+ * For latency: best = lowest latency
+ */
+static result_t run_benchmark_best(size_t size, operation_t op, int nthreads) {
+    result_t best = {0};
+    
+    for (int try = 0; try < g_benchmark_tries; try++) {
+        result_t r = run_benchmark(size, op, nthreads);
+        
+        if (try == 0) {
+            best = r;
+        } else {
+            if (op == OP_LATENCY) {
+                /* For latency: lower is better */
+                if (r.latency_ns > 0 && r.latency_ns < best.latency_ns) {
+                    best = r;
+                }
+            } else {
+                /* For bandwidth: higher is better */
+                if (r.bandwidth_mb_s > best.bandwidth_mb_s) {
+                    best = r;
+                }
+            }
+        }
+    }
+    
+    return best;
 }
 
 /* ============================================================================
@@ -1314,7 +1348,7 @@ static result_t find_best_config(size_t total_size, operation_t op,
         }
         
         /* Standard latency measurement (for first test or single-size mode) */
-        best = run_benchmark(latency_size, op, 1);
+        best = run_benchmark_best(latency_size, op, 1);
         best.size = total_size;  /* Report requested size, not capped size */
         
         /* Update tracking for next test */
@@ -1354,7 +1388,7 @@ static result_t find_best_config(size_t total_size, operation_t op,
         }
         
         /* Run benchmark with this configuration */
-        result_t r = run_benchmark(per_thread_size, op, nthreads);
+        result_t r = run_benchmark_best(per_thread_size, op, nthreads);
         
         /* Store total size (not per-thread) for reporting */
         r.size = total_size;
@@ -1367,7 +1401,7 @@ static result_t find_best_config(size_t total_size, operation_t op,
     /* If no valid configuration found, try single thread */
     if (best.bandwidth_mb_s == 0) {
         size_t single_thread_size = effective_size;
-        best = run_benchmark(single_thread_size, op, 1);
+        best = run_benchmark_best(single_thread_size, op, 1);
         best.size = total_size;
     }
     
@@ -1494,6 +1528,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -f          Full sweep (test all sizes up to 50%% RAM)\n");
     fprintf(stderr, "              Default: test up to 512 MB (enough for main memory BW)\n");
     fprintf(stderr, "  -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)\n");
+    fprintf(stderr, "  -r TRIES    Repeat each test N times, report best (default: %d)\n", DEFAULT_BENCHMARK_TRIES);
     fprintf(stderr, "\n");
     fprintf(stderr, "Output: CSV to stdout with columns:\n");
     fprintf(stderr, "  size_kb        - Memory size tested (KB)\n");
@@ -1513,7 +1548,7 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     int opt;
     
-    while ((opt = getopt(argc, argv, "hvfs:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "hvfs:t:r:")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -1523,6 +1558,10 @@ int main(int argc, char *argv[]) {
                 break;
             case 'f':
                 g_full_sweep = 1;
+                break;
+            case 'r':
+                g_benchmark_tries = atoi(optarg);
+                if (g_benchmark_tries < 1) g_benchmark_tries = 1;
                 break;
             case 's': {
                 long size_kb = atol(optarg);

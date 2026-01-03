@@ -11,6 +11,7 @@ A portable, multi-platform memory bandwidth benchmark designed for comprehensive
 - **Total memory model**: Reports actual total memory footprint, not per-thread size
 - **Thread optimization**: Finds optimal thread/buffer configuration for each total size
 - **Latency measurement**: True memory latency using pointer chasing
+- **Best-of-N runs**: Each test runs multiple times, reports best result (like lmbench)
 - **CSV output**: Machine-readable output for analysis
 
 ## Quick Start
@@ -19,10 +20,10 @@ A portable, multi-platform memory bandwidth benchmark designed for comprehensive
 # Compile
 make
 
-# Run with default settings (10 minute max runtime)
+# Run with default settings (no time limit, tests up to 512MB)
 ./membench
 
-# Run with verbose output and custom runtime
+# Run with verbose output and 5 minute time limit
 ./membench -v -t 300
 
 # Compile with NUMA support (requires libnuma-dev)
@@ -67,6 +68,7 @@ Options:
   -h          Show help
   -v          Verbose output (to stderr)
   -s SIZE_KB  Test only this total size (in KB), e.g. -s 1024 for 1MB
+  -r TRIES    Repeat each test N times, report best (default: 3)
   -f          Full sweep (test all sizes up to 50% RAM)
               Default: test up to 512 MB
   -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)
@@ -210,6 +212,29 @@ When compiled with `-DUSE_NUMA` and linked with `-lnuma`:
 - Distributes threads across NUMA nodes
 - Interleaves memory allocation for fair testing
 - Works transparently on single-node systems
+
+## Best-of-N Runs
+
+Modern CPUs use **frequency scaling** and **turbo boost** which can cause variable benchmark results. Like lmbench (which uses TRIES=11 by default), we run each test configuration multiple times and report the **best result**.
+
+### How It Works
+
+1. Each thread/size configuration is tested 3 times (configurable with `-r`)
+2. For bandwidth tests: highest bandwidth is reported
+3. For latency tests: lowest latency is reported
+
+### Benefits
+
+- **More consistent results**: First runs may have cold caches/low CPU frequency
+- **Natural warmup**: Repeated runs allow CPU to reach turbo frequency
+- **Simple and robust**: No complex warmup logic needed
+
+### Configuration
+
+```bash
+./membench -r 5   # Run each test 5 times instead of 3
+./membench -r 1   # Single run (fastest, but may show lower/variable results)
+```
 
 ## Comparison with lmbench
 
