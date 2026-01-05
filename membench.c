@@ -19,7 +19,7 @@
  *   ./membench -h   # Show help
  *
  * Copyright 2026 Spare Cores
- * Licensed under Apache 2.0
+ * Licensed under Mozilla Public License 2.0
  */
 
 #define _GNU_SOURCE

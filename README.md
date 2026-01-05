@@ -385,7 +385,7 @@ Without libnuma, memory is allocated without NUMA awareness (may underperform on
 
 ## License
 
-Apache 2.0
+Mozilla Public License 2.0
 
 ## See Also
 
