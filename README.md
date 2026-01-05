@@ -7,9 +7,9 @@ A portable, multi-platform memory bandwidth benchmark designed for comprehensive
 - **Multi-platform**: Works on x86, arm64, and other architectures
 - **Multiple operations**: Measures read, write, copy bandwidth + memory latency
 - **NUMA-aware**: Automatically handles NUMA systems (optional, works on non-NUMA too)
-- **Cache analysis**: Sweeps through L1, L2, L3 cache sizes and main memory
-- **Total memory model**: Reports actual total memory footprint, not per-thread size
-- **Thread optimization**: Finds optimal thread/buffer configuration for each total size
+- **Cache-aware sizing**: Adaptive test sizes based on detected L1, L2, L3 cache hierarchy
+- **Per-thread buffer model**: Like bw_mem, each thread gets its own buffer
+- **Thread control**: Default uses all CPUs; optional auto-scaling to find optimal thread count
 - **Latency measurement**: True memory latency using pointer chasing
 - **Best-of-N runs**: Each test runs multiple times, reports best result (like lmbench)
 - **CSV output**: Machine-readable output for analysis
@@ -20,11 +20,14 @@ A portable, multi-platform memory bandwidth benchmark designed for comprehensive
 # Compile
 make
 
-# Run with default settings (no time limit, tests up to 512MB)
+# Run with default settings (uses all CPUs, cache-aware sizes)
 ./membench
 
 # Run with verbose output and 5 minute time limit
 ./membench -v -t 300
+
+# Test specific buffer size (1MB per thread)
+./membench -s 1024
 
 # Compile with NUMA support (requires libnuma-dev)
 make numa
@@ -67,10 +70,12 @@ Usage: ./membench [options]
 Options:
   -h          Show help
   -v          Verbose output (to stderr)
-  -s SIZE_KB  Test only this total size (in KB), e.g. -s 1024 for 1MB
+  -s SIZE_KB  Test only this buffer size (in KB), e.g. -s 1024 for 1MB
   -r TRIES    Repeat each test N times, report best (default: 3)
-  -f          Full sweep (test all sizes up to 50% RAM)
-              Default: test up to 512 MB
+  -f          Full sweep (test larger sizes up to memory limit)
+  -p THREADS  Use exactly this many threads (default: num_cpus)
+  -a          Auto-scaling: try different thread counts to find best
+              (slower but finds optimal thread count per buffer size)
   -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)
 ```
 
@@ -80,25 +85,35 @@ CSV output to stdout with columns:
 
 | Column | Description |
 |--------|-------------|
-| `size_kb` | **Total** memory footprint tested (KB) |
+| `size_kb` | **Per-thread** buffer size (KB) |
 | `operation` | Operation type: `read`, `write`, `copy`, or `latency` |
-| `bandwidth_mb_s` | Bandwidth achieved (MB/s), 0 for latency test |
+| `bandwidth_mb_s` | Aggregate bandwidth across all threads (MB/s), 0 for latency |
 | `latency_ns` | Memory latency (nanoseconds), 0 for bandwidth tests |
-| `threads` | Thread count that achieved best result |
+| `threads` | Thread count used |
 | `iterations` | Number of iterations performed |
 | `elapsed_s` | Elapsed time for the test (seconds) |
+
+**Total memory used** = `size_kb × threads` (or `× 2` for copy which needs src + dst).
 
 ### Example Output
 
 ```csv
 size_kb,operation,bandwidth_mb_s,latency_ns,threads,iterations,elapsed_s
-4,read,8000000.00,0,16,10000000,0.08
-4,write,4000000.00,0,16,6000000,0.10
-16384,read,2200000.00,0,16,100000,0.12
-16384,write,3000000.00,0,32,150000,0.16
-1048576,read,115000.00,0,32,275,2.45
-1048576,write,68000.00,0,32,188,2.83
+16,read,2276940.70,0,48,589309,0.19
+16,write,1302796.66,0,48,350557,0.20
+16,latency,0,1.07,1,48176,0.11
+512,read,807264.98,0,48,11728,0.35
+512,write,726262.08,0,48,8512,0.29
+512,latency,0,4.78,1,316,0.10
+65536,read,113577.83,0,48,23,0.62
+65536,write,46728.81,0,48,20,1.31
+65536,latency,0,65.12,1,3,1.64
 ```
+
+In this example (48-core system with 32KB L1, 1MB L2, 36MB L3):
+- **16KB**: Fits in L1 → very high bandwidth (~2.3 TB/s read), low latency (~1ns)
+- **512KB**: Fits in L2 → good bandwidth (~800 GB/s read), moderate latency (~5ns)
+- **64MB**: Past L3 → RAM bandwidth (~114 GB/s read), high latency (~65ns)
 
 ## Operations Explained
 
@@ -149,60 +164,73 @@ Results are reported in **nanoseconds per access**, not MB/s.
 
 ## Memory Sizes Tested
 
-The benchmark tests **total memory** sizes starting from an **adaptive minimum** based on detected cache topology:
+The benchmark tests **per-thread buffer sizes** at cache transition points, automatically adapting to the detected cache hierarchy:
 
-- **Minimum size**: L1_cache × num_CPUs (e.g., 48KB × 192 CPUs = 9MB on r8a.48xlarge)
-- **Maximum size**: 512MB (default) or up to 50% of RAM (with `-f` flag)
+### Adaptive Cache-Aware Sizes
 
-### Why Adaptive Minimum?
+Based on detected L1, L2, L3 cache sizes:
 
-To measure aggregate system bandwidth (not per-core), we need enough total memory so each thread can have a meaningful buffer. The formula `L1 × num_CPUs` ensures:
+| Size | Purpose |
+|------|---------|
+| L1/2 | Pure L1 cache performance |
+| L1 | L1 cache boundary |
+| 2×L1 | L1→L2 transition (if fits before L2/2) |
+| L2/2 | Pure L2 cache performance |
+| L2 | L2 cache boundary |
+| 2×L2 | L2→L3 transition (if fits before L3/2) |
+| L3/2 | Mid L3 cache |
+| L3 | L3 cache boundary |
+| 2×L3 | Past L3, hitting RAM |
+| 4×L3 | Deep into RAM |
 
-- On 16-core system (48KB L1): minimum = 768KB → can use 16 threads × 48KB each
-- On 192-core system (48KB L1): minimum = 9MB → can use 192 threads × 48KB each
-
-This ensures bandwidth measurements scale properly with core count.
+With `-f` (full sweep), additional larger sizes are tested up to the memory limit.
 
 ### Cache Detection
 
 With hwloc (recommended), cache sizes are detected automatically on any platform.
 Without hwloc, the benchmark parses `/sys/devices/system/cpu/*/cache/` (Linux only).
 
-## Thread Scaling and Total Memory Model
+If cache detection fails, sensible defaults are used (32KB L1, 256KB L2, 8MB L3).
 
-For each **total memory size**, the benchmark tries different thread/buffer configurations while keeping the total memory footprint constant:
+## Thread Model (Per-Thread Buffers)
+
+Like bw_mem, each thread gets its **own private buffer**:
 
 ```
-Example for 1MB total (read/write):
-  1 thread  × 1MB buffer   = 1MB total
-  2 threads × 512KB buffer = 1MB total  
-  4 threads × 256KB buffer = 1MB total
+Example for 1MB buffer size with 4 threads (read/write):
+  Thread 0: 1MB buffer
+  Thread 1: 1MB buffer
+  Thread 2: 1MB buffer
+  Thread 3: 1MB buffer
+  Total memory: 4MB
 
-Example for 1MB total (copy - needs src + dst):
-  1 thread  × 512KB src + 512KB dst = 1MB total
-  2 threads × 256KB src + 256KB dst = 1MB total
+Example for 1MB buffer size with 4 threads (copy):
+  Thread 0: 1MB src + 1MB dst = 2MB
+  Thread 1: 1MB src + 1MB dst = 2MB
+  ...
+  Total memory: 8MB
 ```
 
-The benchmark finds the optimal configuration and reports:
-- `size_kb`: The total memory footprint (not per-thread)
-- `threads`: The winning thread count
-- `bandwidth_mb_s`: The best bandwidth achieved
+### Thread Modes
 
-This approach ensures that **size_kb values are directly comparable** - a 1MB test and a 16GB test both represent actual total memory usage, making the results meaningful for comparing cache vs main memory performance.
+| Mode | Flag | Behavior |
+|------|------|----------|
+| **Default** | (none) | Use `num_cpus` threads |
+| **Explicit** | `-p N` | Use exactly N threads |
+| **Auto-scaling** | `-a` | Try 1, 2, 4, ..., num_cpus threads, report best |
 
-### Why This Matters
+### What the Benchmark Measures
 
-With per-thread buffers, more threads means more total memory. If we reported per-thread size:
-- "1MB" with 24 threads = 24MB actual memory
-- "16GB" with 1 thread = 16GB actual memory
+- **Aggregate bandwidth**: Sum of all threads' bandwidth
+- **Per-thread buffer**: Each thread works on its own memory region
+- **No sharing**: Threads don't contend for the same cache lines
 
-These wouldn't be comparable! By keeping total memory constant and varying thread/buffer splits, we find the true optimal configuration for each memory footprint.
+### Interpreting Results
 
-### What the Benchmark Discovers
-
-- **Small sizes (cache-resident)**: Many threads with small buffers often wins
-- **Large sizes (main memory)**: Fewer threads with larger buffers may be optimal
-- **NUMA systems**: Thread distribution across nodes affects performance
+- `size_kb` = buffer size per thread
+- `threads` = number of threads used
+- `bandwidth_mb_s` = total system bandwidth (all threads combined)
+- Total memory = `size_kb × threads` (×2 for copy)
 
 ## NUMA Support
 
@@ -279,8 +307,8 @@ On NUMA systems, memory is bound to the local NUMA node of each thread's CPU usi
 
 Like lmbench (TRIES=11), each test configuration runs multiple times and reports the best result:
 
-1. Each thread/size configuration is tested 3 times (configurable with `-r`)
-2. First run is a warmup (discarded) to stabilize CPU frequency
+1. First run is a warmup (discarded) to stabilize CPU frequency
+2. Each configuration is then tested 3 times (configurable with `-r`)
 3. For bandwidth: highest bandwidth is reported
 4. For latency: lowest latency is reported
 
@@ -291,8 +319,10 @@ With these optimizations, benchmark variability is typically **<1%** (compared t
 ### Configuration
 
 ```bash
-./membench -r 5   # Run each test 5 times instead of 3
-./membench -r 1   # Single run (fastest, still consistent due to pinning)
+./membench -r 5    # Run each test 5 times instead of 3
+./membench -r 1    # Single run (fastest, still consistent due to pinning)
+./membench -p 16   # Use exactly 16 threads
+./membench -a      # Auto-scale to find optimal thread count
 ```
 
 ## Comparison with lmbench
@@ -303,15 +333,15 @@ With these optimizations, benchmark variability is typically **<1%** (compared t
 |--------|-------------|----------------|
 | **Parallelism model** | Threads | Processes (fork) |
 | **Buffer allocation** | Each thread has own buffer | Each process has own buffer |
-| **Size reporting** | Total memory footprint | Per-process buffer size |
+| **Size reporting** | Per-thread buffer size | Per-process buffer size |
 | **Read operation** | Reads 100% of data | `rd` reads 25% (strided) |
 | **Copy reporting** | Buffer size / time | Buffer size / time |
 
 **Key differences:**
 
-1. **Size meaning**: sc-membench's `size_kb` is total memory used; bw_mem's size is per-process
-2. **Read operation**: bw_mem `rd` uses strided access (reads 25% of data), reporting ~4x higher apparent bandwidth
-3. **Thread optimization**: sc-membench finds optimal thread/buffer configuration for each total size
+1. **Size meaning**: Both report per-worker buffer size (comparable)
+2. **Read operation**: bw_mem `rd` uses strided access (reads 25% of data), reporting ~4x higher apparent bandwidth. sc-membench reads 100% of data.
+3. **Thread control**: sc-membench defaults to num_cpus threads; use `-a` for auto-scaling or `-p N` for explicit count
 
 ### Latency (lat_mem_rd)
 
@@ -328,16 +358,16 @@ Both measure true memory latency by using dependent loads that prevent pipelinin
 ## Interpreting Results
 
 ### Cache Effects
-Look for bandwidth drops and latency increases as sizes exceed cache levels:
-- Dramatic change at L1 boundary (32-64KB typically)
-- Another change at L2 boundary (256KB-1MB typically)
-- Final change at L3 boundary (8-64MB typically)
+Look for bandwidth drops and latency increases as buffer sizes exceed cache levels:
+- Dramatic change at L1 boundary (32-64KB per thread typically)
+- Another change at L2 boundary (256KB-1MB per thread typically)
+- Final change when total memory exceeds L3 (depends on thread count)
 
 ### Thread Configuration
-- Small total sizes: More threads with small buffers (fits in per-core cache)
-- Large total sizes: Fewer threads with larger buffers (memory-bound)
-- NUMA systems: Thread distribution across nodes affects performance
-- Latency test: Always uses 1 thread with full buffer size
+- By default, all CPUs are used for maximum aggregate bandwidth
+- Use `-p N` to test with a specific thread count
+- Use `-a` to find optimal thread count (slower but thorough)
+- Latency test: Always uses 1 thread (measures true access latency)
 
 ### Bandwidth Values
 Typical modern systems:

@@ -58,43 +58,9 @@
 /* Default total runtime target (seconds). 0 = unlimited */
 #define DEFAULT_MAX_RUNTIME 0
 
-/* Memory sizes to test (in bytes) - key points to show cache hierarchy
- * ~20 sizes covering L1, L2, L3, and main memory */
-static const size_t DEFAULT_SIZES[] = {
-    /* L1 cache range (typically 32-64KB per core) */
-    4096,           /* 4 KB */
-    16384,          /* 16 KB */
-    32768,          /* 32 KB */
-    65536,          /* 64 KB */
-    
-    /* L2 cache range (typically 256KB-1MB per core) */
-    131072,         /* 128 KB */
-    262144,         /* 256 KB */
-    524288,         /* 512 KB */
-    1048576,        /* 1 MB */
-    
-    /* L3 cache range (typically 8-256MB shared) */
-    2097152,        /* 2 MB */
-    4194304,        /* 4 MB */
-    8388608,        /* 8 MB */
-    16777216,       /* 16 MB */
-    33554432,       /* 32 MB */
-    67108864,       /* 64 MB */
-    134217728,      /* 128 MB */
-    268435456,      /* 256 MB */
-    
-    /* Main memory */
-    536870912,      /* 512 MB */
-    1073741824,     /* 1 GB */
-    2147483648UL,   /* 2 GB */
-    4294967296UL,   /* 4 GB */
-    8589934592UL,   /* 8 GB */
-    17179869184UL,  /* 16 GB */
-    34359738368UL,  /* 32 GB */
-    68719476736UL,  /* 64 GB */
-    137438953472UL, /* 128 GB */
-    0  /* sentinel */
-};
+/* Fixed RAM sizes for when we need to measure pure memory bandwidth */
+#define RAM_SIZE_1 (64UL * 1024 * 1024)   /* 64 MB - definitely past any L3 */
+#define RAM_SIZE_2 (256UL * 1024 * 1024)  /* 256 MB - more RAM data points */
 
 /* ============================================================================
  * Types
@@ -155,9 +121,13 @@ static int g_node_cpus[MAX_NUMA_NODES][MAX_CPUS_PER_NODE];  /* CPU IDs for each 
 #define DEFAULT_BENCHMARK_TRIES 3
 static int g_benchmark_tries = DEFAULT_BENCHMARK_TRIES;
 
-/* Default max test size for quick sweep (well past any L3 cache)
- * 512MB is enough to measure main memory bandwidth on any system */
-#define DEFAULT_MAX_TEST_SIZE (512UL * 1024 * 1024)  /* 512 MB */
+/* Thread count options:
+ * g_explicit_threads > 0: use exactly that many threads
+ * g_explicit_threads == 0: use num_cpus (default)
+ * g_auto_scaling: try multiple thread counts to find best */
+static int g_explicit_threads = 0;
+static int g_auto_scaling = 0;
+
 static double g_max_runtime = DEFAULT_MAX_RUNTIME;
 
 /* Adaptive latency tracking - used for early termination in series tests */
@@ -1235,18 +1205,17 @@ static result_t run_benchmark_best(size_t size, operation_t op, int nthreads) {
  * Main benchmark loop
  * ============================================================================ */
 
-/* Generate thread counts dynamically based on CPU count
+/* Generate thread counts dynamically based on CPU count (for auto-scaling mode)
  * 
  * Strategy:
- * - Always include 1 (single-threaded baseline)
- * - Powers of 2 up to nproc
- * - Always include nproc itself
- * - Include nproc * 1.5 and nproc * 2 to test oversubscription
+ * - Powers of 2 from 1 up to nproc
+ * - Always include nproc itself (if not already a power of 2)
+ * - No oversubscription (causes unreliable results)
  * 
  * Examples:
- *   32 cores:   1, 2, 4, 8, 16, 32, 48, 64           (8 values)
- *   192 cores:  1, 2, 4, 8, 16, 32, 64, 128, 192, 288, 384  (11 values)
- *   1920 cores: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1920, 2880, 3840 (14 values)
+ *   4 cores:   1, 2, 4               (3 values)
+ *   32 cores:  1, 2, 4, 8, 16, 32    (6 values)
+ *   48 cores:  1, 2, 4, 8, 16, 32, 48 (7 values)
  */
 static int* get_thread_counts(int *count) {
     int nproc = g_num_cpus;
@@ -1275,37 +1244,113 @@ static int* get_thread_counts(int *count) {
     return tc;
 }
 
-/* Get sizes to test */
+/* Round size to nearest power of 2 for cleaner output */
+static size_t round_to_power_of_2(size_t size) {
+    if (size == 0) return 4096;
+    size_t power = 1;
+    while (power < size) power <<= 1;
+    /* Return closer of power and power/2 */
+    if (power - size > size - power/2 && power/2 >= 4096) {
+        return power / 2;
+    }
+    return power;
+}
+
+/* Get sizes to test (per-thread buffer sizes) - adaptive based on cache hierarchy
+ * 
+ * Generates sizes at critical cache transition points to show:
+ * 1. Pure L1 performance
+ * 2. L1 boundary  
+ * 3. L1→L2 transition (between L1 and L2)
+ * 4. Pure L2 performance
+ * 5. L2 boundary
+ * 6. L2→L3 transition (between L2 and L3/RAM)
+ * 7. L3 region
+ * 8-9. Pure RAM bandwidth (64MB, 256MB)
+ * 
+ * All sizes are strictly increasing with no overlaps.
+ */
 static size_t* get_sizes(int *count) {
-    /* Limit to available memory (use max 50% of RAM) */
-    size_t max_size = g_total_memory / 2;
+    int nthreads = g_explicit_threads > 0 ? g_explicit_threads : g_num_cpus;
+    if (nthreads < 1) nthreads = 1;
     
-    /* Start from minimum total size (adaptive based on cache × CPUs) */
-    size_t min_size = g_min_total_size;
+    /* Use detected cache sizes, with sensible defaults */
+    size_t l1 = g_l1_cache_size > 0 ? g_l1_cache_size : 32768;      /* 32 KB */
+    size_t l2 = g_l2_cache_size > 0 ? g_l2_cache_size : 262144;     /* 256 KB */
+    size_t l3 = g_l3_cache_size > 0 ? g_l3_cache_size : 8388608;    /* 8 MB */
     
+    /* Memory limit per thread */
+    size_t max_size = g_total_memory / 2 / nthreads;
+    
+    /* Build strictly increasing size sequence */
+    size_t sizes_list[20];
     int n = 0;
-    for (int i = 0; DEFAULT_SIZES[i] != 0; i++) {
-        if (DEFAULT_SIZES[i] >= min_size && DEFAULT_SIZES[i] <= max_size) n++;
+    size_t prev = 0;
+    
+    /* Helper macro to add size if > prev and <= max_size */
+    #define ADD_SIZE(sz) do { \
+        size_t _s = round_to_power_of_2(sz); \
+        if (_s > prev && _s <= max_size) { sizes_list[n++] = _s; prev = _s; } \
+    } while(0)
+    
+    /* L1 region */
+    ADD_SIZE(l1 / 2);                    /* Pure L1 */
+    ADD_SIZE(l1);                        /* L1 boundary */
+    
+    /* L1→L2 transition: pick a point between L1 and L2/2 */
+    if (l1 * 2 < l2 / 2) {
+        ADD_SIZE(l1 * 2);                /* 2×L1 if it fits before L2/2 */
     }
     
-    /* Always have at least one size */
-    if (n == 0) n = 1;
+    /* L2 region */
+    ADD_SIZE(l2 / 2);                    /* Pure L2 */
+    ADD_SIZE(l2);                        /* L2 boundary */
     
-    size_t *sizes = malloc((n + 1) * sizeof(size_t));
-    int j = 0;
-    for (int i = 0; DEFAULT_SIZES[i] != 0; i++) {
-        if (DEFAULT_SIZES[i] >= min_size && DEFAULT_SIZES[i] <= max_size) {
-            sizes[j++] = DEFAULT_SIZES[i];
+    /* L2→L3 transition: pick a point between L2 and L3 */
+    if (l2 * 2 < l3 / 2) {
+        ADD_SIZE(l2 * 2);                /* 2×L2 if it fits before L3/2 */
+    }
+    
+    /* L3 region */
+    if (l3 > l2) {
+        ADD_SIZE(l3 / 2);                /* Mid L3 */
+        ADD_SIZE(l3);                    /* L3 boundary */
+    }
+    
+    /* RAM region - use cache-aware sizes if L3 detected, otherwise fixed sizes */
+    if (g_l3_cache_size > 0) {
+        /* Use L3-relative sizes to ensure we're past cache */
+        ADD_SIZE(l3 * 2);                /* 2×L3 - definitely past L3 */
+        ADD_SIZE(l3 * 4);                /* 4×L3 - deep into RAM */
+    } else {
+        /* Fallback to fixed sizes when cache detection unavailable */
+        ADD_SIZE(RAM_SIZE_1);            /* 64 MB */
+        ADD_SIZE(RAM_SIZE_2);            /* 256 MB */
+    }
+    
+    /* Full sweep: add larger sizes up to memory limit */
+    if (g_full_sweep) {
+        size_t ram_size = RAM_SIZE_2 * 2;
+        while (ram_size <= max_size && n < 18) {
+            ADD_SIZE(ram_size);
+            ram_size *= 2;
         }
     }
     
-    /* If no sizes matched, use minimum size */
-    if (j == 0) {
-        sizes[j++] = min_size;
+    #undef ADD_SIZE
+    
+    /* Ensure at least one size */
+    if (n == 0) {
+        sizes_list[n++] = 4096;
     }
     
-    sizes[j] = 0;
-    *count = j;
+    /* Copy to result array */
+    size_t *sizes = malloc((n + 1) * sizeof(size_t));
+    for (int i = 0; i < n; i++) {
+        sizes[i] = sizes_list[i];
+    }
+    sizes[n] = 0;
+    *count = n;
     return sizes;
 }
 
@@ -1328,59 +1373,37 @@ static void print_result(const result_t *r) {
     }
 }
 
-/* Minimum per-thread buffer size for reliable measurements.
- * 
- * Very small buffers (< 16KB) cause unreliable results because:
- * - Timing overhead dominates the measurement
- * - Data may stay in registers instead of cache/memory
- * - Loop overhead becomes significant
- * 
- * We use 16KB as the minimum, which:
- * - Is large enough for stable timing
- * - Ensures we're measuring actual memory/cache performance
- * - Matches bw_mem's typical minimum test size
- */
-static size_t get_min_per_thread_size(void) {
-    /* 16KB minimum for reliable measurements */
-    return 16384;
-}
-
 /* Maximum buffer size for latency test.
  * Must exceed largest L3 caches to measure true DRAM latency.
  * AMD EPYC 9754 (Genoa-X) has 1.1GB L3 cache, so we need > 1.1GB.
  * 2GB should cover any current processor. */
 #define MAX_LATENCY_SIZE (2UL * 1024 * 1024 * 1024)  /* 2 GB */
 
-/* Find best thread/buffer configuration for a given TOTAL memory size.
+/* Run benchmark for a given per-thread buffer size.
  * 
- * For total_size = 1MB, we try:
- *   1 thread  × 1MB buffer   = 1MB total
- *   2 threads × 512KB buffer = 1MB total
- *   4 threads × 256KB buffer = 1MB total
- *   etc.
+ * This follows bw_mem's approach:
+ * - size_kb is the per-thread buffer size
+ * - Total memory = size_kb * threads (or size_kb * threads * 2 for copy)
  * 
- * For COPY operations, total_size includes BOTH src and dst buffers:
- *   1 thread  × 512KB src + 512KB dst = 1MB total
- *   2 threads × 256KB src + 256KB dst = 1MB total
- * 
- * This ensures size_kb in output represents actual total memory footprint
- * consistently across all operations.
+ * Three modes:
+ * 1. Auto-scaling (g_auto_scaling=1): Try multiple thread counts, find best
+ * 2. Explicit threads (g_explicit_threads>0): Use exactly that many threads
+ * 3. Default (neither): Use num_cpus threads
  */
-static result_t find_best_config(size_t total_size, operation_t op, 
+static result_t find_best_config(size_t buffer_size, operation_t op, 
                                  int *thread_counts, int tc_count) {
     result_t best = {0};
-    best.size = total_size;
+    best.size = buffer_size;
     best.op = op;
     
-    /* For latency test: single-thread, cap buffer size.
-     * Need buffer larger than L3 cache to measure true DRAM latency.
-     * Cap at MAX_LATENCY_SIZE (2GB) or 25% of available memory, whichever is smaller. */
+    /* For latency test: single-thread only */
     if (op == OP_LATENCY) {
+        /* Cap buffer size for very large latency tests */
         size_t max_latency = MAX_LATENCY_SIZE;
         if (g_total_memory / 4 < max_latency) {
             max_latency = g_total_memory / 4;
         }
-        size_t latency_size = (total_size > max_latency) ? max_latency : total_size;
+        size_t latency_size = (buffer_size > max_latency) ? max_latency : buffer_size;
         
         /* Use adaptive early termination for series tests (not single-size mode)
          * when:
@@ -1388,7 +1411,6 @@ static result_t find_best_config(size_t total_size, operation_t op,
          * - Current size is larger than previous
          * - Current size is > 1.5GB (safely past even AMD EPYC 9754's 1.1GB L3)
          * - Previous latency indicates we're already in DRAM territory (> 50ns)
-         *   Note: L3 latency is typically 10-40ns, DRAM is 60-120ns
          */
         int in_dram_region = (g_prev_latency_ns > 50.0);
         int past_l3_cache = (latency_size > 1536UL * 1024 * 1024);  /* 1.5 GB */
@@ -1411,7 +1433,7 @@ static result_t find_best_config(size_t total_size, operation_t op,
                 
                 free_buffer(buf, latency_size);
                 
-                best.size = total_size;
+                best.size = buffer_size;
                 best.op = op;
                 best.threads = 1;
                 best.latency_ns = latency;
@@ -1427,9 +1449,9 @@ static result_t find_best_config(size_t total_size, operation_t op,
             }
         }
         
-        /* Standard latency measurement (for first test or single-size mode) */
+        /* Standard latency measurement */
         best = run_benchmark_best(latency_size, op, 1);
-        best.size = total_size;  /* Report requested size, not capped size */
+        best.size = buffer_size;  /* Report requested size */
         
         /* Update tracking for next test */
         g_prev_latency_ns = best.latency_ns;
@@ -1438,52 +1460,58 @@ static result_t find_best_config(size_t total_size, operation_t op,
         return best;
     }
     
-    /* For copy: total_size is split between src and dst buffers
-     * So effective_size is what we divide among threads for each buffer */
+    /* Bandwidth tests: buffer_size is per-thread */
+    int nthreads;
+    
+    if (g_auto_scaling) {
+        /* Auto-scaling mode: try all thread counts, find best */
+        for (int i = 0; i < tc_count; i++) {
+            nthreads = thread_counts[i];
+            if (nthreads < 1) continue;
+            
+            /* Check memory limit (buffer_size per thread, ×2 for copy) */
+            int bufs_per_op = (op == OP_COPY) ? 2 : 1;
+            size_t memory_needed = buffer_size * nthreads * bufs_per_op;
+            if (memory_needed > g_total_memory / 4) {
+                continue;
+            }
+            
+            /* Run benchmark */
+            result_t r = run_benchmark_best(buffer_size, op, nthreads);
+            r.size = buffer_size;
+            
+            if (r.bandwidth_mb_s > best.bandwidth_mb_s) {
+                best = r;
+            }
+        }
+        
+        /* If no valid configuration found, try single thread */
+        if (best.bandwidth_mb_s == 0) {
+            best = run_benchmark_best(buffer_size, op, 1);
+            best.size = buffer_size;
+        }
+        
+        return best;
+    }
+    
+    /* Fixed thread count mode (default or explicit) */
+    if (g_explicit_threads > 0) {
+        nthreads = g_explicit_threads;
+    } else {
+        nthreads = g_num_cpus;
+    }
+    
+    /* Check memory limit and reduce threads if needed */
     int bufs_per_op = (op == OP_COPY) ? 2 : 1;
-    size_t effective_size = total_size / bufs_per_op;
-    
-    /* Try different thread counts where total memory stays constant */
-    for (int i = 0; i < tc_count; i++) {
-        int nthreads = thread_counts[i];
-        if (nthreads < 1) continue;
-        
-        /* Calculate per-thread buffer size */
-        size_t per_thread_size = effective_size / nthreads;
-        
-        /* Skip if per-thread buffer would be too small */
-        if (per_thread_size < get_min_per_thread_size()) {
-            continue;
-        }
-        
-        /* Skip if doesn't divide evenly (to keep total exact) */
-        if (per_thread_size * nthreads != effective_size) {
-            continue;
-        }
-        
-        /* Check memory limit */
-        size_t memory_needed = per_thread_size * nthreads * bufs_per_op;
-        if (memory_needed > g_total_memory / 4) {
-            continue;
-        }
-        
-        /* Run benchmark with this configuration */
-        result_t r = run_benchmark_best(per_thread_size, op, nthreads);
-        
-        /* Store total size (not per-thread) for reporting */
-        r.size = total_size;
-        
-        if (r.bandwidth_mb_s > best.bandwidth_mb_s) {
-            best = r;
-        }
+    size_t memory_needed = buffer_size * nthreads * bufs_per_op;
+    while (nthreads > 1 && memory_needed > g_total_memory / 4) {
+        nthreads /= 2;
+        memory_needed = buffer_size * nthreads * bufs_per_op;
     }
     
-    /* If no valid configuration found, try single thread */
-    if (best.bandwidth_mb_s == 0) {
-        size_t single_thread_size = effective_size;
-        best = run_benchmark_best(single_thread_size, op, 1);
-        best.size = total_size;
-    }
+    /* Run benchmark */
+    best = run_benchmark_best(buffer_size, op, nthreads);
+    best.size = buffer_size;
     
     return best;
 }
@@ -1502,7 +1530,7 @@ static void run_all_benchmarks(void) {
     /* Single size mode: test only the specified size */
     if (g_single_size > 0) {
         if (g_verbose) {
-            fprintf(stderr, "Testing total size: %zu KB with various thread/buffer configs\n",
+            fprintf(stderr, "Testing buffer size: %zu KB per thread\n",
                     g_single_size / 1024);
         }
         
@@ -1527,23 +1555,23 @@ static void run_all_benchmarks(void) {
         return;
     }
     
-    /* Normal mode: test all sizes */
+    /* Normal mode: test all sizes (adaptive based on cache hierarchy) */
     int size_count;
     size_t *sizes = get_sizes(&size_count);
     
-    /* Determine max test size */
-    size_t max_test_size = g_full_sweep ? sizes[size_count-1] : DEFAULT_MAX_TEST_SIZE;
-    /* Don't exceed available memory */
-    if (max_test_size > sizes[size_count-1]) {
-        max_test_size = sizes[size_count-1];
-    }
-    
     if (g_verbose) {
-        fprintf(stderr, "Testing %d sizes, up to %d thread configurations\n",
-                size_count, tc_count);
-        fprintf(stderr, "Max test size: %.2f MB%s\n", 
-                max_test_size / (1024.0 * 1024.0),
-                g_full_sweep ? " (full sweep)" : " (use -f for full sweep)");
+        fprintf(stderr, "Testing %d buffer sizes (per thread, adaptive to cache hierarchy)\n", size_count);
+        if (g_auto_scaling) {
+            fprintf(stderr, "Thread mode: auto-scaling (trying 1-%d threads)\n", g_num_cpus);
+        } else if (g_explicit_threads > 0) {
+            fprintf(stderr, "Thread mode: fixed %d threads\n", g_explicit_threads);
+        } else {
+            fprintf(stderr, "Thread mode: num_cpus (%d threads)\n", g_num_cpus);
+        }
+        fprintf(stderr, "Size range: %zu KB - %.2f MB%s\n", 
+                sizes[0] / 1024,
+                sizes[size_count-1] / (1024.0 * 1024.0),
+                g_full_sweep ? " (full sweep)" : "");
         if (g_max_runtime > 0) {
             fprintf(stderr, "Target runtime: %.0f seconds\n", g_max_runtime);
         } else {
@@ -1556,11 +1584,6 @@ static void run_all_benchmarks(void) {
     /* Run benchmarks from small to large */
     for (int s = 0; s < size_count && g_running; s++) {
         size_t size = sizes[s];
-        
-        /* Skip sizes beyond max test size */
-        if (size > max_test_size) {
-            continue;
-        }
         
         for (int op = 0; op < 4 && g_running; op++) {
             result_t best = find_best_config(size, (operation_t)op, 
@@ -1604,23 +1627,26 @@ static void usage(const char *prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h          Show this help\n");
     fprintf(stderr, "  -v          Verbose output (to stderr)\n");
-    fprintf(stderr, "  -s SIZE_KB  Test only this size (in KB), e.g. -s 1024 for 1MB\n");
-    fprintf(stderr, "  -f          Full sweep (test all sizes up to 50%% RAM)\n");
-    fprintf(stderr, "              Default: test up to 512 MB (enough for main memory BW)\n");
+    fprintf(stderr, "  -s SIZE_KB  Test only this buffer size (in KB), e.g. -s 1024 for 1MB\n");
+    fprintf(stderr, "  -f          Full sweep (test all sizes up to memory limit)\n");
+    fprintf(stderr, "              Default: test up to 512 MB per thread\n");
+    fprintf(stderr, "  -p THREADS  Use exactly this many threads (default: num_cpus)\n");
+    fprintf(stderr, "  -a          Auto-scaling: try different thread counts to find best\n");
+    fprintf(stderr, "              (slower but finds optimal thread count per buffer size)\n");
     fprintf(stderr, "  -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)\n");
     fprintf(stderr, "  -r TRIES    Repeat each test N times, report best (default: %d)\n", DEFAULT_BENCHMARK_TRIES);
     fprintf(stderr, "\n");
     fprintf(stderr, "Output: CSV to stdout with columns:\n");
-    fprintf(stderr, "  size_kb        - Memory size tested (KB)\n");
+    fprintf(stderr, "  size_kb        - Per-thread buffer size (KB)\n");
     fprintf(stderr, "  operation      - read, write, copy, or latency\n");
-    fprintf(stderr, "  bandwidth_mb_s - Bandwidth in MB/s (0 for latency test)\n");
-    fprintf(stderr, "  latency_ns     - Memory latency in nanoseconds (0 for bandwidth tests)\n");
-    fprintf(stderr, "  threads        - Thread count for best result\n");
+    fprintf(stderr, "  bandwidth_mb_s - Aggregate bandwidth in MB/s (0 for latency)\n");
+    fprintf(stderr, "  latency_ns     - Memory latency in nanoseconds (0 for bandwidth)\n");
+    fprintf(stderr, "  threads        - Thread count used\n");
     fprintf(stderr, "  iterations     - Iterations performed\n");
     fprintf(stderr, "  elapsed_s      - Elapsed time in seconds\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "The latency test uses pointer chasing to measure true memory\n");
-    fprintf(stderr, "access latency without pipelining or prefetching effects.\n");
+    fprintf(stderr, "Memory model: each thread gets its own buffer.\n");
+    fprintf(stderr, "Total memory = size_kb × threads (×2 for copy: src + dst).\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Compile with -DUSE_NUMA -lnuma for NUMA support.\n");
 }
@@ -1628,7 +1654,7 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     int opt;
     
-    while ((opt = getopt(argc, argv, "hvfs:t:r:")) != -1) {
+    while ((opt = getopt(argc, argv, "hvfas:t:r:p:")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -1639,9 +1665,19 @@ int main(int argc, char *argv[]) {
             case 'f':
                 g_full_sweep = 1;
                 break;
+            case 'a':
+                g_auto_scaling = 1;
+                break;
             case 'r':
                 g_benchmark_tries = atoi(optarg);
                 if (g_benchmark_tries < 1) g_benchmark_tries = 1;
+                break;
+            case 'p':
+                g_explicit_threads = atoi(optarg);
+                if (g_explicit_threads < 1) {
+                    fprintf(stderr, "Invalid thread count: %s\n", optarg);
+                    return 1;
+                }
                 break;
             case 's': {
                 long size_kb = atol(optarg);
