@@ -291,28 +291,41 @@ void mem_copy(void *dst, const void *src, size_t size) {
  * Each load depends on the previous one, preventing pipelining and prefetching
  */
 
-/* Initialize pointer chain with random order to defeat prefetchers */
+/* Initialize pointer chain with random order to defeat prefetchers
+ * Creates a single cycle visiting all elements in random order */
 static void init_pointer_chain(void **buf, size_t count) {
-    /* Start with sequential chain */
-    for (size_t i = 0; i < count - 1; i++) {
-        buf[i] = &buf[i + 1];
-    }
-    buf[count - 1] = &buf[0];  /* Make it circular */
+    if (count < 2) return;
     
-    /* Fisher-Yates shuffle to randomize the chain */
+    /* Create array of indices and shuffle it (Fisher-Yates) */
+    size_t *indices = malloc(count * sizeof(size_t));
+    if (!indices) {
+        /* Fallback to sequential if malloc fails */
+        for (size_t i = 0; i < count - 1; i++) {
+            buf[i] = &buf[i + 1];
+        }
+        buf[count - 1] = &buf[0];
+        return;
+    }
+    
+    for (size_t i = 0; i < count; i++) {
+        indices[i] = i;
+    }
+    
+    /* Fisher-Yates shuffle on indices */
     for (size_t i = count - 1; i > 0; i--) {
         size_t j = (size_t)rand() % (i + 1);
-        /* Swap pointers */
-        void *tmp = buf[i];
-        buf[i] = buf[j];
-        buf[j] = tmp;
+        size_t tmp = indices[i];
+        indices[i] = indices[j];
+        indices[j] = tmp;
     }
     
-    /* Rebuild chain in shuffled order */
+    /* Build chain: element at indices[i] points to element at indices[i+1] */
     for (size_t i = 0; i < count - 1; i++) {
-        *(void **)buf[i] = buf[i + 1];
+        buf[indices[i]] = &buf[indices[i + 1]];
     }
-    *(void **)buf[count - 1] = buf[0];
+    buf[indices[count - 1]] = &buf[indices[0]];  /* Close the loop */
+    
+    free(indices);
 }
 
 /* Chase pointers - each load depends on previous (true latency measurement) */
