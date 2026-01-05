@@ -1626,6 +1626,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h          Show this help\n");
+    fprintf(stderr, "  -V          Print version and exit\n");
     fprintf(stderr, "  -v          Verbose output (to stderr)\n");
     fprintf(stderr, "  -s SIZE_KB  Test only this buffer size (in KB), e.g. -s 1024 for 1MB\n");
     fprintf(stderr, "  -f          Full sweep (test all sizes up to memory limit)\n");
@@ -1654,10 +1655,13 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     int opt;
     
-    while ((opt = getopt(argc, argv, "hvfas:t:r:p:")) != -1) {
+    while ((opt = getopt(argc, argv, "hvfas:t:r:p:V")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
+                return 0;
+            case 'V':
+                printf("%s\n", VERSION);
                 return 0;
             case 'v':
                 g_verbose = 1;
