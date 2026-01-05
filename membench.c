@@ -707,19 +707,14 @@ use_defaults:
     if (g_l3_cache_size == 0) g_l3_cache_size = 8 * 1024 * 1024; /* 8 MB */
     
     /* Calculate adaptive minimum total size:
-     * Use L1 cache size × num_cpus so each thread can have a meaningful buffer.
-     * This ensures we can parallelize even the smallest tests. */
-    g_min_total_size = g_l1_cache_size * g_num_cpus;
-    
-    /* But cap it at a reasonable minimum for small systems */
-    if (g_min_total_size < 64 * 1024) {
-        g_min_total_size = 64 * 1024;  /* At least 64 KB */
-    }
+     * Use 16KB per thread × num_cpus so each thread has a reliable buffer size.
+     * This ensures all CPUs can participate with meaningful measurements. */
+    g_min_total_size = 16384 * g_num_cpus;  /* 16KB per thread minimum */
     
     if (g_verbose) {
         fprintf(stderr, "Cache (hwloc): L1d=%zuKB, L2=%zuKB, L3=%zuKB (per core)\n",
                 g_l1_cache_size / 1024, g_l2_cache_size / 1024, g_l3_cache_size / 1024);
-        fprintf(stderr, "Minimum total test size: %zu KB (L1 × %d CPUs)\n",
+        fprintf(stderr, "Minimum total test size: %zu KB (16KB × %d CPUs)\n",
                 g_min_total_size / 1024, g_num_cpus);
     }
 }
@@ -797,16 +792,14 @@ static void init_cache_info(void) {
     if (g_l2_cache_size == 0) g_l2_cache_size = 256 * 1024;     /* 256 KB */
     if (g_l3_cache_size == 0) g_l3_cache_size = 8 * 1024 * 1024; /* 8 MB */
     
-    /* Calculate adaptive minimum total size */
-    g_min_total_size = g_l1_cache_size * g_num_cpus;
-    if (g_min_total_size < 64 * 1024) {
-        g_min_total_size = 64 * 1024;
-    }
+    /* Calculate adaptive minimum total size:
+     * Use 16KB per thread × num_cpus so each thread has a reliable buffer size. */
+    g_min_total_size = 16384 * g_num_cpus;  /* 16KB per thread minimum */
     
     if (g_verbose) {
         fprintf(stderr, "Cache (sysfs): L1d=%zuKB, L2=%zuKB, L3=%zuKB (per core)\n",
                 g_l1_cache_size / 1024, g_l2_cache_size / 1024, g_l3_cache_size / 1024);
-        fprintf(stderr, "Minimum total test size: %zu KB (L1 × %d CPUs)\n",
+        fprintf(stderr, "Minimum total test size: %zu KB (16KB × %d CPUs)\n",
                 g_min_total_size / 1024, g_num_cpus);
     }
 }
@@ -1246,34 +1239,22 @@ static int* get_thread_counts(int *count) {
     int nproc = g_num_cpus;
     if (nproc < 1) nproc = 1;
     
-    /* Max threads to test (allow some oversubscription) */
-    int max_threads = nproc * 2;
-    if (max_threads > 8192) max_threads = 8192;
+    /* Cap at nproc - oversubscription causes unreliable benchmark results
+     * due to context switching, cache thrashing, and scheduler interference */
+    int max_threads = nproc;
     
     /* Allocate more than enough space */
     int *tc = malloc(32 * sizeof(int));
     int n = 0;
     
     /* Add powers of 2 up to nproc */
-    for (int t = 1; t <= nproc && t <= max_threads; t *= 2) {
+    for (int t = 1; t <= max_threads; t *= 2) {
         tc[n++] = t;
     }
     
     /* Add nproc if not already in list (i.e., not a power of 2) */
     if (tc[n-1] != nproc) {
         tc[n++] = nproc;
-    }
-    
-    /* Add 1.5x and 2x nproc for oversubscription testing */
-    int nproc_1_5 = (nproc * 3) / 2;
-    int nproc_2 = nproc * 2;
-    
-    /* Only add if they're different from what we have and within limits */
-    if (nproc_1_5 > tc[n-1] && nproc_1_5 <= max_threads) {
-        tc[n++] = nproc_1_5;
-    }
-    if (nproc_2 > tc[n-1] && nproc_2 <= max_threads) {
-        tc[n++] = nproc_2;
     }
     
     tc[n] = 0;  /* Sentinel */
@@ -1334,18 +1315,21 @@ static void print_result(const result_t *r) {
     }
 }
 
-/* Get minimum per-thread buffer size - adaptive based on L1 cache.
- * We want each thread to have enough data to measure meaningful bandwidth,
- * but not so much that we can't parallelize small total sizes.
- * Use L1_cache / 8 as a reasonable minimum (e.g., 48KB L1 → 6KB per thread). */
+/* Minimum per-thread buffer size for reliable measurements.
+ * 
+ * Very small buffers (< 16KB) cause unreliable results because:
+ * - Timing overhead dominates the measurement
+ * - Data may stay in registers instead of cache/memory
+ * - Loop overhead becomes significant
+ * 
+ * We use 16KB as the minimum, which:
+ * - Is large enough for stable timing
+ * - Ensures we're measuring actual memory/cache performance
+ * - Matches bw_mem's typical minimum test size
+ */
 static size_t get_min_per_thread_size(void) {
-    size_t min_size = g_l1_cache_size / 8;
-    
-    /* But not smaller than 1KB (too much overhead) or larger than 16KB */
-    if (min_size < 1024) min_size = 1024;
-    if (min_size > 16384) min_size = 16384;
-    
-    return min_size;
+    /* 16KB minimum for reliable measurements */
+    return 16384;
 }
 
 /* Maximum buffer size for latency test.
