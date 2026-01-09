@@ -34,6 +34,29 @@ make numa
 ./membench-numa -v
 ```
 
+## Docker Usage
+
+The easiest way to run sc-membench without building is using the pre-built Docker image:
+
+```bash
+# Run with default settings
+docker run --rm ghcr.io/sparecores/membench:main
+
+# Run with verbose output and time limit
+docker run --rm ghcr.io/sparecores/membench:main -v -t 300
+
+# Test specific buffer size
+docker run --rm ghcr.io/sparecores/membench:main -s 1024
+
+# For best performance, use --privileged (recommended)
+docker run --rm --privileged ghcr.io/sparecores/membench:main -v
+
+# Save output to file
+docker run --rm --privileged ghcr.io/sparecores/membench:main > results.csv
+```
+
+**Note:** The `--privileged` flag is recommended for best performance.
+
 ## Build Options
 
 ```bash
