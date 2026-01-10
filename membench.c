@@ -44,7 +44,7 @@
  * Configuration
  * ============================================================================ */
 
-#define VERSION "1.0.0"
+#define VERSION "1.0.1"
 
 /* Target time per individual measurement (seconds) */
 #define TARGET_TIME_PER_TEST 0.1
