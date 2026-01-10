@@ -485,12 +485,18 @@ With these optimizations, benchmark variability is typically **<1%** (compared t
 | **Size reporting** | Per-thread buffer size | Per-process buffer size |
 | **Read operation** | Reads 100% of data | `rd` reads 25% (strided) |
 | **Copy reporting** | Buffer size / time | Buffer size / time |
+| **Huge pages** | Built-in (`-H` flag) | Not supported (uses `valloc`) |
+| **Operation selection** | `-o read/write/copy/latency` | Separate invocations per operation |
+| **Output format** | CSV (stdout) | Text to stderr |
+| **Full vs strided read** | Always 100% (`read`) | `rd` (25% strided) or `frd` (100%) |
 
 **Key differences:**
 
 1. **Size meaning**: Both report per-worker buffer size (comparable)
-2. **Read operation**: bw_mem `rd` uses strided access (reads 25% of data), reporting ~4x higher apparent bandwidth. sc-membench reads 100% of data.
+2. **Read operation**: bw_mem `rd` uses 32-byte stride (reads 25% of data at indices 0,4,8...124 per 512-byte chunk), reporting ~4x higher apparent bandwidth. Use `frd` for full read. sc-membench always reads 100%.
 3. **Thread control**: sc-membench defaults to num_cpus threads; use `-a` for auto-scaling or `-p N` for explicit count
+4. **Huge pages**: sc-membench has built-in support (`-H`) with automatic THP fallback; lmbench has no huge page support
+5. **Workflow**: sc-membench runs all tests in one invocation; bw_mem requires separate runs per operation (`bw_mem 64m rd`, `bw_mem 64m wr`, etc.)
 
 ### Latency (lat_mem_rd)
 
@@ -499,10 +505,17 @@ sc-membench's `latency` operation is comparable to lmbench's `lat_mem_rd`:
 | Aspect | sc-membench latency | lmbench lat_mem_rd |
 |--------|---------------------|-------------------|
 | **Method** | Pointer chasing | Pointer chasing |
-| **Order** | Randomized | Configurable stride |
+| **Pointer order** | Randomized (defeats prefetching) | Fixed backward stride (may be prefetched) |
+| **Stride** | Random (visits all elements) | Configurable (default 64 bytes on 64-bit) |
 | **Output** | Nanoseconds | Nanoseconds |
+| **Huge pages** | Built-in (`-H` flag) | Not supported |
+| **TLB measurement** | Compare with/without `-H` | Mentioned but no support |
 
-Both measure true memory latency by using dependent loads that prevent pipelining and prefetching.
+Both measure memory latency using dependent loads (`p = *p`) that prevent pipelining.
+
+**Key difference - prefetching vulnerability**: lat_mem_rd uses fixed backward stride, which modern CPUs may prefetch (the man page acknowledges: "vulnerable to smart, stride-sensitive cache prefetching policies"). sc-membench's randomized pointer chain defeats all prefetching, measuring true random-access latency.
+
+**Huge pages advantage**: With `-H`, sc-membench automatically uses huge pages for large buffers, eliminating TLB overhead that can inflate latency by 20-40% (see [benchmark results](#real-world-benchmark-results)).
 
 ## Interpreting Results
 
