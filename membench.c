@@ -133,6 +133,10 @@ static double g_max_runtime = DEFAULT_MAX_RUNTIME;
 /* Huge pages support */
 static int g_use_hugepages = 0;
 
+/* Operation selection bitmask (bit 0=read, 1=write, 2=copy, 3=latency) */
+#define OP_MASK_ALL 0x0F  /* All operations enabled */
+static int g_ops_mask = OP_MASK_ALL;
+
 /* Adaptive latency tracking - used for early termination in series tests */
 static double g_prev_latency_ns = 0;
 static size_t g_prev_latency_size = 0;
@@ -1604,6 +1608,9 @@ static void run_all_benchmarks(void) {
         print_csv_header();
         
         for (int op = 0; op < 4 && g_running; op++) {
+            /* Skip operations not in the selected mask */
+            if (!(g_ops_mask & (1 << op))) continue;
+            
             result_t best = find_best_config(g_single_size, (operation_t)op, 
                                             thread_counts, tc_count);
             
@@ -1653,6 +1660,9 @@ static void run_all_benchmarks(void) {
         size_t size = sizes[s];
         
         for (int op = 0; op < 4 && g_running; op++) {
+            /* Skip operations not in the selected mask */
+            if (!(g_ops_mask & (1 << op))) continue;
+            
             result_t best = find_best_config(size, (operation_t)op, 
                                              thread_counts, tc_count);
             
@@ -1703,6 +1713,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "              (slower but finds optimal thread count per buffer size)\n");
     fprintf(stderr, "  -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)\n");
     fprintf(stderr, "  -r TRIES    Repeat each test N times, report best (default: %d)\n", DEFAULT_BENCHMARK_TRIES);
+    fprintf(stderr, "  -o OP       Run only this operation: read, write, copy, or latency\n");
+    fprintf(stderr, "              Can be specified multiple times (default: all)\n");
     fprintf(stderr, "  -H          Enable huge pages for large buffers (>= 4MB)\n");
     fprintf(stderr, "              Uses THP (no setup needed) or explicit 2MB pages\n");
     fprintf(stderr, "              Automatically skipped for small buffers\n");
@@ -1724,8 +1736,9 @@ static void usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
     int opt;
+    int ops_specified = 0;  /* Track if -o was used */
     
-    while ((opt = getopt(argc, argv, "hvfas:t:r:p:VH")) != -1) {
+    while ((opt = getopt(argc, argv, "hvfas:t:r:p:o:VH")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -1769,6 +1782,27 @@ int main(int argc, char *argv[]) {
                     return 1;
                 }
                 break;
+            case 'o': {
+                /* First -o clears the default "all" mask */
+                if (!ops_specified) {
+                    g_ops_mask = 0;
+                    ops_specified = 1;
+                }
+                /* Parse operation name */
+                if (strcmp(optarg, "read") == 0) {
+                    g_ops_mask |= (1 << OP_READ);
+                } else if (strcmp(optarg, "write") == 0) {
+                    g_ops_mask |= (1 << OP_WRITE);
+                } else if (strcmp(optarg, "copy") == 0) {
+                    g_ops_mask |= (1 << OP_COPY);
+                } else if (strcmp(optarg, "latency") == 0) {
+                    g_ops_mask |= (1 << OP_LATENCY);
+                } else {
+                    fprintf(stderr, "Invalid operation: %s (use: read, write, copy, latency)\n", optarg);
+                    return 1;
+                }
+                break;
+            }
             case 'H':
                 g_use_hugepages = 1;
                 break;

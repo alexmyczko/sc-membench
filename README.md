@@ -102,6 +102,8 @@ Options:
   -a          Auto-scaling: try different thread counts to find best
               (slower but finds optimal thread count per buffer size)
   -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)
+  -o OP       Run only this operation: read, write, copy, or latency
+              Can be specified multiple times (default: all)
   -H          Enable huge pages for large buffers (>= 4MB)
               Uses THP automatically, no setup required
 ```
