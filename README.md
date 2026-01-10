@@ -408,23 +408,34 @@ With 2MB huge pages:
 - Almost no TLB misses
 - Measured latency ≈ **true memory latency**
 
-Example results on a typical system:
-```
-# Without huge pages (includes TLB overhead)
-131072,latency,0,91.11,1,3,4.59
+### Real-world benchmark results
 
-# With huge pages (true memory latency)
-131072,latency,0,63.27,1,3,3.18
-```
+Measured on [**Azure Standard_D96pls_v6**](https://sparecores.com/server/azure/Standard_D96pls_v6) (96 ARM64 Neoverse-N2 cores, 2 NUMA nodes, L1d=64KB/core, L2=1MB/core, L3=128MB shared):
 
-The ~63 ns is the more accurate measurement - the ~91 ns included ~28 ns of TLB miss overhead.
+| Buffer | No Huge Pages | THP Only | Pre-allocated HP | THP Improvement |
+|--------|---------------|----------|------------------|-----------------|
+| 32 KB  | 1.18 ns | 1.18 ns | 1.18 ns | — |
+| 64 KB  | 1.18 ns | 1.18 ns | 1.18 ns | — |
+| 128 KB | 2.69 ns | 2.72 ns | 2.70 ns | — |
+| 512 KB | 4.24 ns | 4.25 ns | 4.22 ns | — |
+| 1 MB   | 6.84 ns | 5.26 ns | 9.29 ns | -23% |
+| 2 MB   | 21.15 ns | 22.26 ns | 21.45 ns | — |
+| **64 MB** | **44.71 ns** | **35.49 ns** | **35.16 ns** | **-21%** |
+| **128 MB** | **91.11 ns** | **63.27 ns** | **63.42 ns** | **-31%** |
+| **256 MB** | **114.03 ns** | **101.26 ns** | **99.82 ns** | **-12%** |
+
+**Key observations:**
+- **Small buffers (≤ 2MB)**: No significant difference — TLB can handle the page count
+- **Large buffers (≥ 64MB)**: 12-31% lower latency with huge pages
+- **THP vs pre-allocated**: Nearly identical results — THP works just as well without manual setup
+- The 128MB result shows the largest improvement: **91 ns → 63 ns** (28 ns of TLB overhead removed)
+
+**Bottom line**: Use `-H` for accurate latency measurements on large buffers. THP (automatic) works as well as pre-allocated huge pages.
 
 **Bandwidth tests** don't improve as much because:
 - Sequential access has better TLB locality (same pages accessed repeatedly)
 - Hardware prefetchers hide TLB miss latency
 - The memory bus is already saturated
-
-**Bottom line**: Use `-H` for accurate latency measurements. The latency without `-H` includes TLB overhead that isn't really "memory latency."
 
 ## Consistent Results
 
