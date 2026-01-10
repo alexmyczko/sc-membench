@@ -105,7 +105,7 @@ typedef struct {
 
 static pthread_barrier_t g_barrier;
 static volatile int g_running = 1;
-static int g_verbose = 0;
+static int g_verbose = 0;  /* 0=quiet, 1=summary, 2=detailed */
 static int g_full_sweep = 0;      /* If 1, test all sizes up to max; if 0, stop early when converged */
 static size_t g_single_size = 0;  /* If > 0, test only this size (in bytes) */
 static int g_num_cpus = 0;
@@ -129,6 +129,9 @@ static int g_explicit_threads = 0;
 static int g_auto_scaling = 0;
 
 static double g_max_runtime = DEFAULT_MAX_RUNTIME;
+
+/* Huge pages support */
+static int g_use_hugepages = 0;
 
 /* Adaptive latency tracking - used for early termination in series tests */
 static double g_prev_latency_ns = 0;
@@ -595,10 +598,74 @@ static void* thread_worker(void *arg) {
  * Memory allocation
  * ============================================================================ */
 
+/* Huge page size (2MB on most Linux systems) */
+#define HUGE_PAGE_SIZE (2UL * 1024 * 1024)
+
+/* Minimum buffer size to use huge pages (4MB = 2 huge pages).
+ * Below this threshold, TLB pressure isn't significant and huge pages
+ * would waste memory (each allocation rounds up to 2MB boundary). */
+#define HUGE_PAGE_THRESHOLD (4UL * 1024 * 1024)
+
 static void* alloc_buffer(size_t size) {
-    void *buf;
+    void *buf = MAP_FAILED;
+    int try_hugepages = g_use_hugepages && (size >= HUGE_PAGE_THRESHOLD);
     
-    /* Use mmap for large allocations, aligned and zero-initialized */
+    if (try_hugepages) {
+        /* 
+         * Strategy: prefer THP over explicit huge pages because:
+         * 1. THP doesn't require pre-allocation by root
+         * 2. THP is managed automatically by the kernel
+         * 3. Explicit huge pages may fail if pool isn't configured
+         * 
+         * We try explicit huge pages first only because they're more
+         * deterministic (guaranteed 2MB pages vs THP's best-effort).
+         */
+        
+        /* Round up size to huge page boundary for explicit huge pages */
+        size_t aligned_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+        
+#ifdef MAP_HUGETLB
+        /* Try explicit huge pages (uses pre-allocated pool if available) */
+        buf = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        if (buf != MAP_FAILED) {
+            if (g_verbose >= 2) {
+                fprintf(stderr, "  Allocated %zu bytes using explicit 2MB huge pages\n", aligned_size);
+            }
+            /* Touch all pages to ensure they're allocated */
+            memset(buf, 0, size);
+            return buf;
+        }
+        /* Explicit huge pages failed - likely no pool configured, try THP */
+#endif
+        
+        /* Use mmap + madvise for Transparent Huge Pages (no pre-allocation needed) */
+        buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (buf != MAP_FAILED) {
+#ifdef MADV_HUGEPAGE
+            /* Hint to kernel: please use huge pages for this region.
+             * The kernel will use THP if available and beneficial.
+             * This doesn't require root or pre-allocation. */
+            if (madvise(buf, size, MADV_HUGEPAGE) == 0) {
+                if (g_verbose >= 2) {
+                    fprintf(stderr, "  Allocated %zu bytes with THP (transparent huge pages)\n", size);
+                }
+            } else if (g_verbose >= 2) {
+                fprintf(stderr, "  Allocated %zu bytes (THP hint failed, using regular pages)\n", size);
+            }
+#else
+            if (g_verbose >= 2) {
+                fprintf(stderr, "  Allocated %zu bytes (THP not available on this system)\n", size);
+            }
+#endif
+            /* Touch all pages to ensure they're allocated */
+            memset(buf, 0, size);
+            return buf;
+        }
+    }
+    
+    /* Regular allocation: small buffers, huge pages disabled, or fallback */
     buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     
@@ -1627,7 +1694,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h          Show this help\n");
     fprintf(stderr, "  -V          Print version and exit\n");
-    fprintf(stderr, "  -v          Verbose output (to stderr)\n");
+    fprintf(stderr, "  -v          Verbose output (use -vv for more detail)\n");
     fprintf(stderr, "  -s SIZE_KB  Test only this buffer size (in KB), e.g. -s 1024 for 1MB\n");
     fprintf(stderr, "  -f          Full sweep (test all sizes up to memory limit)\n");
     fprintf(stderr, "              Default: test up to 512 MB per thread\n");
@@ -1636,6 +1703,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "              (slower but finds optimal thread count per buffer size)\n");
     fprintf(stderr, "  -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)\n");
     fprintf(stderr, "  -r TRIES    Repeat each test N times, report best (default: %d)\n", DEFAULT_BENCHMARK_TRIES);
+    fprintf(stderr, "  -H          Enable huge pages for large buffers (>= 4MB)\n");
+    fprintf(stderr, "              Uses THP (no setup needed) or explicit 2MB pages\n");
+    fprintf(stderr, "              Automatically skipped for small buffers\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Output: CSV to stdout with columns:\n");
     fprintf(stderr, "  size_kb        - Per-thread buffer size (KB)\n");
@@ -1655,7 +1725,7 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     int opt;
     
-    while ((opt = getopt(argc, argv, "hvfas:t:r:p:V")) != -1) {
+    while ((opt = getopt(argc, argv, "hvfas:t:r:p:VH")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -1664,7 +1734,7 @@ int main(int argc, char *argv[]) {
                 printf("%s\n", VERSION);
                 return 0;
             case 'v':
-                g_verbose = 1;
+                g_verbose++;
                 break;
             case 'f':
                 g_full_sweep = 1;
@@ -1698,6 +1768,9 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "Invalid runtime: %s (use 0 for unlimited)\n", optarg);
                     return 1;
                 }
+                break;
+            case 'H':
+                g_use_hugepages = 1;
                 break;
             default:
                 usage(argv[0]);

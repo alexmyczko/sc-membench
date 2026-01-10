@@ -48,14 +48,16 @@ docker run --rm ghcr.io/sparecores/membench:main -v -t 300
 # Test specific buffer size
 docker run --rm ghcr.io/sparecores/membench:main -s 1024
 
-# For best performance, use --privileged (recommended)
-docker run --rm --privileged ghcr.io/sparecores/membench:main -v
+# Recommended: use --privileged and huge pages for best accuracy
+docker run --rm --privileged ghcr.io/sparecores/membench:main -H -v
 
 # Save output to file
-docker run --rm --privileged ghcr.io/sparecores/membench:main > results.csv
+docker run --rm --privileged ghcr.io/sparecores/membench:main -H > results.csv
 ```
 
-**Note:** The `--privileged` flag is recommended for best performance.
+**Notes:**
+- The `--privileged` flag is recommended for optimal CPU pinning and NUMA support
+- The `-H` flag enables huge pages automatically for large buffers (≥ 4MB), no setup required
 
 ## Build Options
 
@@ -92,7 +94,7 @@ Usage: ./membench [options]
 
 Options:
   -h          Show help
-  -v          Verbose output (to stderr)
+  -v          Verbose output (use -vv for more detail)
   -s SIZE_KB  Test only this buffer size (in KB), e.g. -s 1024 for 1MB
   -r TRIES    Repeat each test N times, report best (default: 3)
   -f          Full sweep (test larger sizes up to memory limit)
@@ -100,6 +102,8 @@ Options:
   -a          Auto-scaling: try different thread counts to find best
               (slower but finds optimal thread count per buffer size)
   -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)
+  -H          Enable huge pages for large buffers (>= 4MB)
+              Uses THP automatically, no setup required
 ```
 
 ## Output Format
@@ -310,6 +314,115 @@ NUMA topology:
   Node 0: 96 CPUs (first: 0, last: 95)
   Node 1: 96 CPUs (first: 96, last: 191)
 ```
+
+## Huge Pages Support
+
+Use `-H` to enable huge pages (2MB instead of 4KB). This reduces TLB (Translation Lookaside Buffer) pressure, which is especially beneficial for:
+
+- **Large buffer tests**: A 2GB buffer needs 512K page table entries with 4KB pages, but only 1024 with 2MB huge pages
+- **Latency tests**: Random pointer-chasing access patterns cause many TLB misses with small pages
+- **Accurate measurements**: TLB overhead can distort results, making memory appear slower than it is
+
+### Automatic and smart
+
+The `-H` option is designed to "just work":
+
+1. **Automatic threshold**: Huge pages are only used for buffers ≥ 4MB. Smaller buffers use regular pages automatically (no wasted memory, no user intervention needed).
+
+2. **No setup required**: The benchmark uses **Transparent Huge Pages (THP)** via `madvise(MADV_HUGEPAGE)`, which is handled automatically by the Linux kernel. No root access or pre-allocation needed.
+
+3. **Graceful fallback**: If THP isn't available, the benchmark falls back to regular pages transparently.
+
+### How it works
+
+When `-H` is enabled and buffer size ≥ 4MB:
+
+1. **First tries explicit huge pages** (`MAP_HUGETLB`) for deterministic 2MB pages
+2. **Falls back to THP** (`madvise(MADV_HUGEPAGE)`) which works without pre-configuration
+3. **Falls back to regular pages** if neither is available
+
+### Optional: Pre-allocating explicit huge pages
+
+For the most deterministic results, you can pre-allocate explicit huge pages:
+
+```bash
+# Check current huge page status
+grep Huge /proc/meminfo
+
+# Calculate huge pages needed for BANDWIDTH tests (read/write/copy):
+#   threads × buffer_size × 2 (for copy: src+dst) / 2MB
+#
+# Examples:
+#   8 CPUs,  256 MiB buffer:   8 × 256 × 2 / 2 =  2,048 pages (4 GB)
+#   64 CPUs, 256 MiB buffer:  64 × 256 × 2 / 2 = 16,384 pages (32 GB)
+#  192 CPUs, 256 MiB buffer: 192 × 256 × 2 / 2 = 49,152 pages (96 GB)
+#
+# LATENCY tests run single-threaded, so need much less:
+#   256 MiB buffer: 256 / 2 = 128 pages (256 MB)
+
+# Allocate huge pages (requires root) - adjust for your system
+echo 49152 | sudo tee /proc/sys/vm/nr_hugepages
+
+# Run with huge pages (will use explicit huge pages if available)
+./membench -H -v
+```
+
+However, this is **optional** - THP works well for most use cases without any setup, and doesn't require pre-allocation. If explicit huge pages run out, the benchmark automatically falls back to THP.
+
+### Usage recommendation
+
+Just add `-H` to your command line - the benchmark handles everything automatically:
+
+```bash
+# Recommended for production benchmarking
+./membench -H
+
+# With verbose output to see what's happening
+./membench -H -v
+```
+
+The benchmark will use huge pages only where they help (large buffers) and regular pages where they don't (small buffers).
+
+### Why latency improves more than bandwidth
+
+You may notice that `-H` dramatically improves latency measurements (often 20-40% lower) while bandwidth stays roughly the same. This is expected:
+
+**Latency tests** use pointer chasing - random jumps through memory. Each access requires address translation via the TLB (Translation Lookaside Buffer):
+
+| Buffer Size | 4KB pages | 2MB huge pages |
+|-------------|-----------|----------------|
+| 128 MB | 32,768 pages | 64 pages |
+| TLB fit? | No (TLB ~1000-2000 entries) | Yes |
+| TLB misses | Frequent | Rare |
+
+With 4KB pages on a 128MB buffer:
+- 32,768 pages can't fit in the TLB
+- Random pointer chasing causes frequent TLB misses
+- Each TLB miss adds **10-20+ CPU cycles** (page table walk)
+- Measured latency = true memory latency + TLB overhead
+
+With 2MB huge pages:
+- Only 64 pages easily fit in the TLB
+- Almost no TLB misses
+- Measured latency ≈ **true memory latency**
+
+Example results on a typical system:
+```
+# Without huge pages (includes TLB overhead)
+131072,latency,0,91.11,1,3,4.59
+
+# With huge pages (true memory latency)
+131072,latency,0,63.27,1,3,3.18
+```
+
+The ~63 ns is the more accurate measurement - the ~91 ns included ~28 ns of TLB miss overhead.
+
+**Bandwidth tests** don't improve as much because:
+- Sequential access has better TLB locality (same pages accessed repeatedly)
+- Hardware prefetchers hide TLB miss latency
+- The memory bus is already saturated
+
+**Bottom line**: Use `-H` for accurate latency measurements. The latency without `-H` includes TLB overhead that isn't really "memory latency."
 
 ## Consistent Results
 
