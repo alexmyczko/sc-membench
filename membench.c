@@ -44,12 +44,12 @@
  * Configuration
  * ============================================================================ */
 
-#define VERSION "1.0.1"
+#define VERSION "1.0.2"
 
 /* Target time per individual measurement (seconds) */
-#define TARGET_TIME_PER_TEST 0.1
+#define TARGET_TIME_PER_TEST 0.25
 
-/* Minimum iterations per test */
+/* Minimum iterations per test (keep low for large buffers that take seconds per iteration) */
 #define MIN_ITERATIONS 3
 
 /* Maximum iterations per test */
@@ -463,52 +463,6 @@ static double mem_latency_adaptive(void *start, size_t buf_count,
 /* ============================================================================
  * Thread worker
  * ============================================================================ */
-
-/* Single-threaded benchmark - no thread overhead */
-static void run_single_thread(thread_work_t *work) {
-    void *src = work->src;
-    void *dst = work->dst;
-    size_t size = work->size;
-    uint64_t checksum = 0;
-    int iterations = work->iterations;
-    
-    double start = get_time();
-    
-    switch (work->op) {
-        case OP_READ:
-            for (int i = 0; i < iterations; i++) {
-                checksum += mem_read(src, size);
-            }
-            break;
-            
-        case OP_WRITE:
-            for (int i = 0; i < iterations; i++) {
-                mem_write(src, size, (uint64_t)i);
-            }
-            break;
-            
-        case OP_COPY:
-            for (int i = 0; i < iterations; i++) {
-                mem_copy(dst, src, size);
-            }
-            break;
-            
-        case OP_LATENCY: {
-            /* Pointer chasing - count is number of pointers in the buffer */
-            size_t count = size / sizeof(void*);
-            size_t accesses = count * iterations;
-            void *result = mem_latency_chase(src, accesses);
-            checksum = (uint64_t)(uintptr_t)result;
-            break;
-        }
-    }
-    
-    double end = get_time();
-    
-    work->elapsed = end - start;
-    work->checksum = checksum;
-}
-
 
 static void* thread_worker(void *arg) {
     thread_work_t *work = (thread_work_t *)arg;
@@ -983,9 +937,92 @@ static void init_system_info(void) {
  * Benchmark runner
  * ============================================================================ */
 
-/* Calibrate iterations for target time */
-static int calibrate_iterations(void *src, void *dst, size_t size, 
-                                operation_t op) {
+/* 
+ * Run benchmark dynamically until both conditions are met:
+ * 1. At least MIN_ITERATIONS completed
+ * 2. At least TARGET_TIME_PER_TEST elapsed
+ * 
+ * This ensures small buffers run long enough for accuracy,
+ * while large buffers don't run excessively.
+ * Used for single-threaded path.
+ */
+typedef struct {
+    int iterations;
+    double elapsed;
+    uint64_t checksum;
+} dynamic_result_t;
+
+static dynamic_result_t run_dynamic_benchmark(void *src, void *dst, size_t size, operation_t op) {
+    dynamic_result_t result = {0, 0.0, 0};
+    uint64_t checksum = 0;
+    int iterations = 0;
+    
+    /* Warmup pass */
+    switch (op) {
+        case OP_READ:
+            checksum += mem_read(src, size);
+            break;
+        case OP_WRITE:
+            mem_write(src, size, 0x1234567890ABCDEFULL);
+            break;
+        case OP_COPY:
+            mem_copy(dst, src, size);
+            break;
+        case OP_LATENCY: {
+            size_t count = size / sizeof(void*);
+            checksum += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
+            break;
+        }
+    }
+    
+    double start = get_time();
+    
+    /* Run until both MIN_ITERATIONS and TARGET_TIME are satisfied */
+    while (1) {
+        switch (op) {
+            case OP_READ:
+                checksum += mem_read(src, size);
+                break;
+            case OP_WRITE:
+                mem_write(src, size, (uint64_t)iterations);
+                break;
+            case OP_COPY:
+                mem_copy(dst, src, size);
+                break;
+            case OP_LATENCY: {
+                size_t count = size / sizeof(void*);
+                checksum += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
+                break;
+            }
+        }
+        iterations++;
+        
+        double elapsed = get_time() - start;
+        
+        /* Stop when BOTH conditions are met */
+        if (iterations >= MIN_ITERATIONS && elapsed >= TARGET_TIME_PER_TEST) {
+            result.elapsed = elapsed;
+            break;
+        }
+        
+        /* Safety limit */
+        if (iterations >= MAX_ITERATIONS) {
+            result.elapsed = elapsed;
+            break;
+        }
+    }
+    
+    result.iterations = iterations;
+    result.checksum = checksum;
+    return result;
+}
+
+/* 
+ * Calibrate iterations for multi-threaded tests.
+ * For multi-threaded, all threads must run the same number of iterations,
+ * so we pre-calculate based on a calibration run.
+ */
+static int calibrate_iterations(void *src, void *dst, size_t size, operation_t op) {
     /* Warmup pass */
     switch (op) {
         case OP_READ:
@@ -1004,30 +1041,25 @@ static int calibrate_iterations(void *src, void *dst, size_t size,
         }
     }
     
-    /* Calibration run - do multiple passes for small buffers */
-    int cal_iters = (size < 65536) ? 100 : 10;
-    
+    /* Time a single iteration to estimate */
     double start = get_time();
-    for (int i = 0; i < cal_iters; i++) {
-        switch (op) {
-            case OP_READ:
-                g_sink += mem_read(src, size);
-                break;
-            case OP_WRITE:
-                mem_write(src, size, 0x1234567890ABCDEFULL);
-                break;
-            case OP_COPY:
-                mem_copy(dst, src, size);
-                break;
-            case OP_LATENCY: {
-                size_t count = size / sizeof(void*);
-                g_sink += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
-                break;
-            }
+    switch (op) {
+        case OP_READ:
+            g_sink += mem_read(src, size);
+            break;
+        case OP_WRITE:
+            mem_write(src, size, 0x1234567890ABCDEFULL);
+            break;
+        case OP_COPY:
+            mem_copy(dst, src, size);
+            break;
+        case OP_LATENCY: {
+            size_t count = size / sizeof(void*);
+            g_sink += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
+            break;
         }
     }
-    double elapsed = get_time() - start;
-    double time_per_iter = elapsed / cal_iters;
+    double time_per_iter = get_time() - start;
     
     if (time_per_iter < 1e-9) time_per_iter = 1e-9;
     
@@ -1051,7 +1083,7 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
     result.op = op;
     result.threads = nthreads;
     
-    /* For single-threaded, use simple path */
+    /* For single-threaded, use dynamic timing path */
     if (nthreads == 1) {
         void *src = alloc_buffer(size);
         void *dst = (op == OP_COPY) ? alloc_buffer(size) : NULL;
@@ -1072,35 +1104,27 @@ static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
             if (dst) memset(dst, 0, size);
         }
         
-        int iterations = calibrate_iterations(src, dst, size, op);
-        result.iterations = iterations;
+        /* Run dynamically until MIN_ITERATIONS and TARGET_TIME are both satisfied */
+        dynamic_result_t dyn = run_dynamic_benchmark(src, dst, size, op);
         
-        thread_work_t work = {0};
-        work.src = src;
-        work.dst = dst;
-        work.size = size;
-        work.op = op;
-        work.iterations = iterations;
-        
-        run_single_thread(&work);
-        
-        g_sink += work.checksum;
-        result.elapsed_s = work.elapsed;
+        g_sink += dyn.checksum;
+        result.iterations = dyn.iterations;
+        result.elapsed_s = dyn.elapsed;
         
         if (op == OP_LATENCY) {
             /* Latency = time / total_accesses (in nanoseconds) */
             size_t count = size / sizeof(void*);
-            size_t total_accesses = count * iterations;
-            if (work.elapsed > 0 && total_accesses > 0) {
-                result.latency_ns = (work.elapsed * 1e9) / total_accesses;
+            size_t total_accesses = count * dyn.iterations;
+            if (dyn.elapsed > 0 && total_accesses > 0) {
+                result.latency_ns = (dyn.elapsed * 1e9) / total_accesses;
             }
         } else {
             /* Bandwidth = (size per thread * threads * iterations) / time
              * Note: for copy, we report buffer size (not 2x) to match bw_mem */
-            size_t bytes_transferred = size * iterations;
+            size_t bytes_transferred = size * dyn.iterations;
             
-            if (work.elapsed > 0) {
-                result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / work.elapsed;
+            if (dyn.elapsed > 0) {
+                result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / dyn.elapsed;
             }
         }
         
