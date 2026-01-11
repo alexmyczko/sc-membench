@@ -410,25 +410,26 @@ With 2MB huge pages:
 
 ### Real-world benchmark results
 
-Measured on [**Azure Standard_D96pls_v6**](https://sparecores.com/server/azure/Standard_D96pls_v6) (96 ARM64 Neoverse-N2 cores, 2 NUMA nodes, L1d=64KB/core, L2=1MB/core, L3=128MB shared):
+Measured on [**AWS c8a.metal-48xl**](https://sparecores.com/server/aws/c8a.metal-48xl) (192 AMD EPYC 9R45 cores, 2 NUMA nodes, L1d=48KB/core, L2=1MB/core, L3=32MB/die × 24 dies):
 
 | Buffer | No Huge Pages | THP Only | Pre-allocated HP | THP Improvement |
 |--------|---------------|----------|------------------|-----------------|
-| 32 KB  | 1.18 ns | 1.18 ns | 1.18 ns | — |
-| 64 KB  | 1.18 ns | 1.18 ns | 1.18 ns | — |
-| 128 KB | 2.69 ns | 2.72 ns | 2.70 ns | — |
-| 512 KB | 4.24 ns | 4.25 ns | 4.22 ns | — |
-| 1 MB   | 6.84 ns | 5.26 ns | 9.29 ns | -23% |
-| 2 MB   | 21.15 ns | 22.26 ns | 21.45 ns | — |
-| **64 MB** | **44.71 ns** | **35.49 ns** | **35.16 ns** | **-21%** |
-| **128 MB** | **91.11 ns** | **63.27 ns** | **63.42 ns** | **-31%** |
-| **256 MB** | **114.03 ns** | **101.26 ns** | **99.82 ns** | **-12%** |
+| 32 KB  | 0.89 ns | 0.89 ns | 0.89 ns | HP not used (< 4MB) |
+| 64 KB  | 1.53 ns | 1.54 ns | 1.54 ns | HP not used (< 4MB) |
+| 128 KB | 2.35 ns | 2.35 ns | 2.36 ns | HP not used (< 4MB) |
+| 512 KB | 3.31 ns | 3.31 ns | 3.31 ns | HP not used (< 4MB) |
+| 1 MB   | 4.69 ns | 4.60 ns | 5.37 ns | HP not used (< 4MB) |
+| 2 MB   | 8.61 ns | 8.66 ns | 8.68 ns | HP not used (< 4MB) |
+| 16 MB  | 12.30 ns | 10.70 ns | 10.70 ns | -13% |
+| **32 MB** | **29.16 ns** | **11.17 ns** | **11.16 ns** | **-62%** |
+| **64 MB** | **86.06 ns** | **74.05 ns** | **74.32 ns** | **-14%** |
+| **128 MB** | **115.65 ns** | **101.08 ns** | **102.28 ns** | **-13%** |
 
 **Key observations:**
 - **Small buffers (≤ 2MB)**: No significant difference — TLB can handle the page count
-- **Large buffers (≥ 64MB)**: 12-31% lower latency with huge pages
+- **32 MB buffer**: Dramatic **62% improvement** — this is right at the L3 cache boundary (32MB/die)
+- **Large buffers (≥ 64MB)**: 13-14% lower latency with huge pages
 - **THP vs pre-allocated**: Nearly identical results — THP works just as well without manual setup
-- The 128MB result shows the largest improvement: **91 ns → 63 ns** (28 ns of TLB overhead removed)
 
 **Bottom line**: Use `-H` for accurate latency measurements on large buffers. THP (automatic) works as well as pre-allocated huge pages.
 
