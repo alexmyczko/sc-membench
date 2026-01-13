@@ -1599,51 +1599,32 @@ static size_t* get_sizes(int *count) {
         if (_s > prev && _s <= max_size) { sizes_list[n++] = _s; prev = _s; } \
     } while(0)
     
-    /* L1 region */
-    ADD_SIZE(l1 / 2);                    /* Pure L1 */
-    ADD_SIZE(l1);                        /* L1 boundary */
+    /* L1 region - single point is enough, L1 performance is flat */
+    ADD_SIZE(l1 / 2);                    /* Pure L1 (e.g., 32KB for 64KB L1) */
     
-    /* L1→L2 transition: pick a point between L1 and L2/2 */
-    if (l1 * 2 < l2 / 2) {
-        ADD_SIZE(l1 * 2);                /* 2×L1 if it fits before L2/2 */
-    }
+    /* L1→L2 transition */
+    ADD_SIZE(l1 * 2);                    /* Past L1, into L2 */
     
     /* L2 region */
-    ADD_SIZE(l2 / 2);                    /* Pure L2 */
+    ADD_SIZE(l2 / 2);                    /* Mid L2 */
     ADD_SIZE(l2);                        /* L2 boundary */
     
-    /* L2→L3 transition: pick a point between L2 and L3 */
-    if (l2 * 2 < l3 / 2) {
-        ADD_SIZE(l2 * 2);                /* 2×L2 if it fits before L3/2 */
-    }
+    /* L2→L3 transition */
+    ADD_SIZE(l2 * 2);                    /* Past L2, into L3 */
     
-    /* L3 region - need multiple points for large L3 caches (e.g., 128MB+)
-     * Add points at powers of 2 within L3 to capture the full L3 latency curve */
-    if (l3 > l2) {
-        /* Start from 4×L2 (or l2*2 if already added) up through L3 */
-        size_t l3_start = l2 * 4;  /* Start well into L3 */
-        
-        /* Add logarithmically spaced points within L3 */
-        for (size_t sz = l3_start; sz < l3; sz *= 2) {
-            if (sz > l2 * 2) {  /* Don't duplicate l2*2 */
-                ADD_SIZE(sz);
-            }
-        }
-        
-        /* L3 boundary */
-        ADD_SIZE(l3);
+    /* L3 region - just need 1-2 points to show the L3 plateau
+     * Don't need many points since L3 latency is relatively flat */
+    if (l3 > l2 * 4) {
+        ADD_SIZE(l3 / 4);                /* Mid L3 (e.g., 32MB for 128MB L3) */
     }
+    ADD_SIZE(l3 / 2);                    /* Late L3 (e.g., 64MB for 128MB L3) */
     
-    /* RAM region - use cache-aware sizes if L3 detected, otherwise fixed sizes */
-    if (g_l3_cache_size > 0) {
-        /* Use L3-relative sizes to ensure we're past cache */
-        ADD_SIZE(l3 * 2);                /* 2×L3 - definitely past L3 */
-        ADD_SIZE(l3 * 4);                /* 4×L3 - deep into RAM */
-    } else {
-        /* Fallback to fixed sizes when cache detection unavailable */
-        ADD_SIZE(RAM_SIZE_1);            /* 64 MB */
-        ADD_SIZE(RAM_SIZE_2);            /* 256 MB */
-    }
+    /* L3→RAM transition */
+    ADD_SIZE(l3);                        /* L3 boundary */
+    
+    /* RAM region */
+    ADD_SIZE(l3 * 2);                    /* Past L3, into RAM */
+    ADD_SIZE(l3 * 4);                    /* Deep in RAM */
     
     /* Full sweep: add larger sizes up to memory limit */
     if (g_full_sweep) {
