@@ -1617,10 +1617,21 @@ static size_t* get_sizes(int *count) {
         ADD_SIZE(l2 * 2);                /* 2×L2 if it fits before L3/2 */
     }
     
-    /* L3 region */
+    /* L3 region - need multiple points for large L3 caches (e.g., 128MB+)
+     * Add points at powers of 2 within L3 to capture the full L3 latency curve */
     if (l3 > l2) {
-        ADD_SIZE(l3 / 2);                /* Mid L3 */
-        ADD_SIZE(l3);                    /* L3 boundary */
+        /* Start from 4×L2 (or l2*2 if already added) up through L3 */
+        size_t l3_start = l2 * 4;  /* Start well into L3 */
+        
+        /* Add logarithmically spaced points within L3 */
+        for (size_t sz = l3_start; sz < l3; sz *= 2) {
+            if (sz > l2 * 2) {  /* Don't duplicate l2*2 */
+                ADD_SIZE(sz);
+            }
+        }
+        
+        /* L3 boundary */
+        ADD_SIZE(l3);
     }
     
     /* RAM region - use cache-aware sizes if L3 detected, otherwise fixed sizes */
