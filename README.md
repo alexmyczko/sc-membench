@@ -312,22 +312,19 @@ When compiled with `-DUSE_NUMA` and linked with `-lnuma`:
 
 ### NUMA Load Balancing
 
-On multi-socket systems, threads are distributed **round-robin across NUMA nodes** to ensure balanced utilization of all memory controllers.
+On multi-socket systems, OpenMP's `proc_bind(spread)` distributes threads **evenly across NUMA nodes** to ensure balanced utilization of all memory controllers.
 
 **Example: 128 threads on a 2-node system (96 CPUs per node):**
 
 ```
-Without balancing (sequential):          With balancing (round-robin):
-  Thread 0-95  → Node 0 (96 threads)       Thread 0  → Node 0, CPU 0
-  Thread 96-127 → Node 1 (32 threads)      Thread 1  → Node 1, CPU 96
-  Result: Node 0 overloaded!               Thread 2  → Node 0, CPU 1
-                                           Thread 3  → Node 1, CPU 97
-                                           ...
-                                           Result: 64 threads per node (balanced!)
+Without spread (may cluster):           With proc_bind(spread):
+  Thread 0-95  → Node 0 (96 threads)      Threads spread evenly across nodes
+  Thread 96-127 → Node 1 (32 threads)     ~64 threads per node
+  Result: Node 0 overloaded!              Result: Balanced utilization!
 ```
 
 **Impact:**
-- ~15% higher bandwidth with balanced distribution
+- Higher bandwidth with balanced distribution
 - More accurate measurement of total system memory bandwidth
 - Exercises all memory controllers evenly
 
