@@ -346,17 +346,53 @@ static void shuffle_nodes(LatencyNode **nodes, size_t n) {
     }
 }
 
+/* Allocate memory for latency chain with NUMA awareness
+ * Uses mmap for large allocations and binds to local NUMA node when available */
+static LatencyNode* alloc_latency_memory(size_t num_nodes, size_t *alloc_size) {
+    size_t size = num_nodes * sizeof(LatencyNode);
+    *alloc_size = size;
+    
+    /* Use mmap for consistent behavior with rest of benchmark */
+    LatencyNode *memory = (LatencyNode *)mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) return NULL;
+    
+#ifdef USE_NUMA
+    /* Bind memory to NUMA node 0 (where CPU 0 is) for consistent latency measurement */
+    if (numa_available() >= 0 && g_numa_nodes > 1) {
+        int node = numa_node_of_cpu(0);
+        if (node >= 0) {
+            unsigned long nodemask = 1UL << node;
+            mbind(memory, size, MPOL_BIND, &nodemask, g_numa_nodes + 1, MPOL_MF_MOVE);
+            if (g_verbose >= 2) {
+                fprintf(stderr, "  Latency memory bound to NUMA node %d\n", node);
+            }
+        }
+    }
+#endif
+    
+    return memory;
+}
+
+/* Free latency chain memory allocated via mmap */
+static void free_latency_memory(LatencyNode *memory, size_t alloc_size) {
+    if (memory && alloc_size > 0) {
+        munmap(memory, alloc_size);
+    }
+}
+
 /* Initialize linked list with random traversal order
  * Memory is contiguous (good for allocation) but traversal is random
- * (defeats prefetcher, measures true memory latency) */
-static LatencyNode* init_latency_chain(size_t num_nodes) {
+ * (defeats prefetcher, measures true memory latency)
+ * Returns: start node pointer; caller must track alloc_size for freeing */
+static LatencyNode* init_latency_chain(size_t num_nodes, size_t *alloc_size) {
     if (num_nodes < 2) return NULL;
     
-    /* Allocate contiguous memory for all nodes */
-    LatencyNode *memory = (LatencyNode *)malloc(num_nodes * sizeof(LatencyNode));
+    /* Allocate contiguous memory for all nodes using NUMA-aware allocation */
+    LatencyNode *memory = alloc_latency_memory(num_nodes, alloc_size);
     if (!memory) return NULL;
     
-    /* Initialize payloads */
+    /* Initialize payloads (also touches pages for NUMA first-touch policy) */
     for (size_t i = 0; i < num_nodes; i++) {
         memory[i].payload = i;  /* Unique payload for each node */
     }
@@ -364,7 +400,7 @@ static LatencyNode* init_latency_chain(size_t num_nodes) {
     /* Create array of pointers for shuffling */
     LatencyNode **nodes = (LatencyNode **)malloc(num_nodes * sizeof(LatencyNode *));
     if (!nodes) {
-        free(memory);
+        free_latency_memory(memory, *alloc_size);
         return NULL;
     }
     
@@ -387,12 +423,11 @@ static LatencyNode* init_latency_chain(size_t num_nodes) {
     return start;
 }
 
-/* Free latency chain memory
- * Since we allocated contiguously, we can find the base address */
-static void free_latency_chain(LatencyNode *start, size_t num_nodes) {
+/* Free latency chain - need base address and size */
+static void free_latency_chain(LatencyNode *start, size_t num_nodes, size_t alloc_size) {
     if (!start || num_nodes == 0) return;
     
-    /* Find the lowest address in the chain (that's where malloc'd block starts) */
+    /* Find the lowest address in the chain (that's where mmap'd block starts) */
     LatencyNode *min_addr = start;
     LatencyNode *node = start->next;
     size_t visited = 1;
@@ -402,7 +437,19 @@ static void free_latency_chain(LatencyNode *start, size_t num_nodes) {
         visited++;
     }
     
-    free(min_addr);
+    free_latency_memory(min_addr, alloc_size);
+}
+
+/* Pin current thread to CPU 0 for consistent latency measurement */
+static void pin_thread_to_cpu0(void) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);  /* 0 = current thread */
+    
+    if (g_verbose >= 2) {
+        fprintf(stderr, "  Latency thread pinned to CPU 0\n");
+    }
 }
 
 /* Chase through linked list - each load depends on previous
@@ -465,12 +512,18 @@ typedef struct {
 static latency_stats_t measure_latency_stats(size_t buffer_size) {
     latency_stats_t stats = {0};
     
+    /* Pin thread to CPU 0 for consistent latency measurement.
+     * This prevents OS scheduler from migrating the thread during measurement,
+     * which would cause inconsistent results due to cache effects and NUMA. */
+    pin_thread_to_cpu0();
+    
     /* Calculate number of nodes that fit in buffer */
     size_t num_nodes = buffer_size / sizeof(LatencyNode);
     if (num_nodes < 64) num_nodes = 64;  /* Minimum for meaningful measurement */
     
-    /* Initialize chain */
-    LatencyNode *start = init_latency_chain(num_nodes);
+    /* Initialize chain with NUMA-aware allocation */
+    size_t alloc_size = 0;
+    LatencyNode *start = init_latency_chain(num_nodes, &alloc_size);
     if (!start) {
         fprintf(stderr, "Failed to allocate %zu bytes for latency test\n", 
                 num_nodes * sizeof(LatencyNode));
@@ -554,7 +607,7 @@ static latency_stats_t measure_latency_stats(size_t buffer_size) {
     stats.total_accesses = total_accesses;
     
     /* Cleanup */
-    free_latency_chain(start, num_nodes);
+    free_latency_chain(start, num_nodes, alloc_size);
     
     return stats;
 }
