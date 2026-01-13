@@ -1,18 +1,19 @@
 /*
- * sc-membench - Portable Memory Bandwidth Benchmark
+ * sc-membench - Portable Memory Bandwidth and Latency Benchmark
  *
- * A multi-platform memory bandwidth benchmark that:
+ * A multi-platform memory benchmark that:
  * - Works on x86, arm64, and other architectures
  * - Measures read, write, and copy bandwidth
+ * - Measures memory latency using pointer chasing
  * - Handles NUMA automatically (works on non-NUMA too)
  * - Sweeps through cache and memory sizes
  * - Finds optimal thread count for peak bandwidth
  * - Outputs CSV format for analysis
  *
  * Compile:
- *   gcc -O3 -pthread -o membench membench.c
+ *   gcc -O3 -pthread -o membench membench.c -lm
  *   # With NUMA support (optional):
- *   gcc -O3 -pthread -DUSE_NUMA -o membench membench.c -lnuma
+ *   gcc -O3 -pthread -DUSE_NUMA -o membench membench.c -lnuma -lm
  *
  * Usage:
  *   ./membench [options]
@@ -34,6 +35,7 @@
 #include <errno.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <math.h>
 
 #ifdef USE_NUMA
 #include <numa.h>
@@ -94,7 +96,11 @@ typedef struct {
     operation_t op;
     int threads;
     double bandwidth_mb_s;  /* For read/write/copy */
-    double latency_ns;      /* For latency test */
+    double latency_ns;      /* For latency test (median) */
+    double latency_mean_ns; /* For latency test (mean) */
+    double latency_stddev_ns; /* For latency test (standard deviation) */
+    double latency_cv;      /* Coefficient of variation (stddev/mean) */
+    int latency_samples;    /* Number of samples for latency measurement */
     double elapsed_s;
     int iterations;
 } result_t;
@@ -137,9 +143,6 @@ static int g_use_hugepages = 0;
 #define OP_MASK_ALL 0x0F  /* All operations enabled */
 static int g_ops_mask = OP_MASK_ALL;
 
-/* Adaptive latency tracking - used for early termination in series tests */
-static double g_prev_latency_ns = 0;
-static size_t g_prev_latency_size = 0;
 
 /* Detected cache sizes (per core) */
 static size_t g_l1_cache_size = 0;
@@ -265,18 +268,305 @@ void mem_copy(void *dst, const void *src, size_t size) {
 
 /* 
  * Memory latency test using pointer chasing
- * Each load depends on the previous one, preventing pipelining and prefetching
+ * 
+ * This implementation is based on ram_bench by Emil Ernerfeldt:
+ *   https://github.com/emilk/ram_bench
+ * 
+ * Recommended by Alex Miller.
+ * 
+ * Uses a linked list traversal approach where each node contains a payload
+ * and a pointer to the next node. Nodes are allocated contiguously but
+ * linked in random order to defeat hardware prefetchers.
+ * 
+ * Key insight from ram_bench: random memory access cost is O(√N) due to
+ * cache hierarchy (L1, L2, L3, RAM) and the fundamental limit that memory
+ * within distance r from CPU is bounded by r² (Bekenstein bound).
  */
 
-/* Initialize pointer chain with random order to defeat prefetchers
- * Creates a single cycle visiting all elements in random order */
+/* Node structure for linked list traversal (16 bytes like ram_bench)
+ * The payload prevents compiler from optimizing away the traversal
+ * and makes the structure cache-line realistic */
+typedef struct LatencyNode LatencyNode;
+struct LatencyNode {
+    uint64_t payload;      /* Dummy data for realistic cache behavior */
+    LatencyNode *next;     /* Pointer to next node in chain */
+};
+
+/* Statistical parameters for latency measurement */
+#define LATENCY_MIN_SAMPLES 7        /* Minimum samples for statistical validity */
+#define LATENCY_MAX_SAMPLES 21       /* Maximum samples (enough for robust statistics) */
+#define LATENCY_TARGET_CV 0.05       /* Target coefficient of variation (5%) */
+
+/* Comparison function for qsort (double ascending) */
+static int compare_double(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+/* Calculate median of sorted array */
+static double calculate_median(double *sorted, int n) {
+    if (n == 0) return 0;
+    if (n % 2 == 0) {
+        return (sorted[n/2 - 1] + sorted[n/2]) / 2.0;
+    }
+    return sorted[n/2];
+}
+
+/* Calculate mean of array */
+static double calculate_mean(double *arr, int n) {
+    if (n == 0) return 0;
+    double sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += arr[i];
+    }
+    return sum / n;
+}
+
+/* Calculate standard deviation of array */
+static double calculate_stddev(double *arr, int n, double mean) {
+    if (n < 2) return 0;
+    double sum_sq = 0;
+    for (int i = 0; i < n; i++) {
+        double diff = arr[i] - mean;
+        sum_sq += diff * diff;
+    }
+    return sqrt(sum_sq / (n - 1));  /* Sample standard deviation */
+}
+
+/* Fisher-Yates shuffle for node pointer array */
+static void shuffle_nodes(LatencyNode **nodes, size_t n) {
+    for (size_t i = n - 1; i > 0; i--) {
+        size_t j = (size_t)rand() % (i + 1);
+        LatencyNode *tmp = nodes[i];
+        nodes[i] = nodes[j];
+        nodes[j] = tmp;
+    }
+}
+
+/* Initialize linked list with random traversal order
+ * Memory is contiguous (good for allocation) but traversal is random
+ * (defeats prefetcher, measures true memory latency) */
+static LatencyNode* init_latency_chain(size_t num_nodes) {
+    if (num_nodes < 2) return NULL;
+    
+    /* Allocate contiguous memory for all nodes */
+    LatencyNode *memory = (LatencyNode *)malloc(num_nodes * sizeof(LatencyNode));
+    if (!memory) return NULL;
+    
+    /* Initialize payloads */
+    for (size_t i = 0; i < num_nodes; i++) {
+        memory[i].payload = i;  /* Unique payload for each node */
+    }
+    
+    /* Create array of pointers for shuffling */
+    LatencyNode **nodes = (LatencyNode **)malloc(num_nodes * sizeof(LatencyNode *));
+    if (!nodes) {
+        free(memory);
+        return NULL;
+    }
+    
+    for (size_t i = 0; i < num_nodes; i++) {
+        nodes[i] = &memory[i];
+    }
+    
+    /* Shuffle to create random traversal order */
+    shuffle_nodes(nodes, num_nodes);
+    
+    /* Link nodes in shuffled order (circular) */
+    for (size_t i = 0; i < num_nodes - 1; i++) {
+        nodes[i]->next = nodes[i + 1];
+    }
+    nodes[num_nodes - 1]->next = nodes[0];  /* Close the loop */
+    
+    LatencyNode *start = nodes[0];
+    free(nodes);
+    
+    return start;
+}
+
+/* Free latency chain memory
+ * Since we allocated contiguously, we can find the base address */
+static void free_latency_chain(LatencyNode *start, size_t num_nodes) {
+    if (!start || num_nodes == 0) return;
+    
+    /* Find the lowest address in the chain (that's where malloc'd block starts) */
+    LatencyNode *min_addr = start;
+    LatencyNode *node = start->next;
+    size_t visited = 1;
+    while (node != start && visited < num_nodes) {
+        if (node < min_addr) min_addr = node;
+        node = node->next;
+        visited++;
+    }
+    
+    free(min_addr);
+}
+
+/* Chase through linked list - each load depends on previous
+ * Returns final node pointer to prevent optimization */
+static inline __attribute__((always_inline))
+LatencyNode* chase_latency_chain(LatencyNode *start, size_t count) {
+    LatencyNode *node = start;
+    volatile uint64_t sink = 0;  /* Prevent optimization */
+    
+    /* Unroll 8x to reduce loop overhead while maintaining dependency chain */
+    size_t i = count;
+    while (i >= 8) {
+        sink += node->payload; node = node->next;
+        sink += node->payload; node = node->next;
+        sink += node->payload; node = node->next;
+        sink += node->payload; node = node->next;
+        sink += node->payload; node = node->next;
+        sink += node->payload; node = node->next;
+        sink += node->payload; node = node->next;
+        sink += node->payload; node = node->next;
+        i -= 8;
+    }
+    while (i > 0) {
+        sink += node->payload;
+        node = node->next;
+        i--;
+    }
+    
+    g_sink += sink;  /* Store to global to prevent optimization */
+    return node;
+}
+
+/* Result structure for latency measurement with statistics */
+typedef struct {
+    double median_ns;      /* Median latency (robust to outliers) */
+    double mean_ns;        /* Mean latency */
+    double stddev_ns;      /* Standard deviation */
+    double cv;             /* Coefficient of variation (stddev/mean) */
+    int num_samples;       /* Number of samples collected */
+    size_t total_accesses; /* Total node accesses performed */
+} latency_stats_t;
+
+/* Target time per sample in seconds - long enough for timer precision,
+ * short enough for reasonable total measurement time */
+#define LATENCY_TARGET_SAMPLE_TIME 0.1  /* 100ms per sample */
+#define LATENCY_MIN_SAMPLE_TIME 0.01    /* 10ms minimum for timer precision */
+
+/* Measure latency with statistical validity
+ * 
+ * Strategy:
+ * 1. Create random linked list covering the buffer size
+ * 2. Warmup by traversing the list once
+ * 3. Calibration run to estimate latency and calculate traversals needed
+ * 4. Collect multiple independent time samples
+ * 5. Continue until CV < target or max samples reached
+ * 6. Report median (robust to outliers) and statistics
+ *
+ * Returns statistically valid latency measurement
+ */
+static latency_stats_t measure_latency_stats(size_t buffer_size) {
+    latency_stats_t stats = {0};
+    
+    /* Calculate number of nodes that fit in buffer */
+    size_t num_nodes = buffer_size / sizeof(LatencyNode);
+    if (num_nodes < 64) num_nodes = 64;  /* Minimum for meaningful measurement */
+    
+    /* Initialize chain */
+    LatencyNode *start = init_latency_chain(num_nodes);
+    if (!start) {
+        fprintf(stderr, "Failed to allocate %zu bytes for latency test\n", 
+                num_nodes * sizeof(LatencyNode));
+        return stats;
+    }
+    
+    /* Warmup: single traversal to prime caches and stabilize CPU */
+    chase_latency_chain(start, num_nodes);
+    
+    /* Calibration: time a single traversal to estimate latency */
+    double cal_start = get_time();
+    chase_latency_chain(start, num_nodes);
+    double cal_elapsed = get_time() - cal_start;
+    
+    /* Calculate traversals needed to achieve target sample time */
+    double estimated_latency_s = cal_elapsed / num_nodes;
+    size_t traversals_per_sample;
+    
+    if (estimated_latency_s > 0) {
+        /* Calculate traversals to reach target sample time */
+        double target_accesses = LATENCY_TARGET_SAMPLE_TIME / estimated_latency_s;
+        traversals_per_sample = (size_t)(target_accesses / num_nodes);
+        
+        /* Ensure at least 1 full traversal per sample */
+        if (traversals_per_sample < 1) traversals_per_sample = 1;
+        
+        /* Cap at reasonable maximum for very fast (L1) accesses */
+        if (traversals_per_sample > 10000) traversals_per_sample = 10000;
+    } else {
+        /* Fallback: at least 1 traversal */
+        traversals_per_sample = 1;
+    }
+    
+    /* Sample collection */
+    double samples[LATENCY_MAX_SAMPLES];
+    int num_samples = 0;
+    size_t total_accesses = 0;
+    
+    /* Collect samples until statistically valid or max reached */
+    while (num_samples < LATENCY_MAX_SAMPLES) {
+        size_t accesses_this_sample = num_nodes * traversals_per_sample;
+        
+        /* Time this sample */
+        double start_time = get_time();
+        chase_latency_chain(start, accesses_this_sample);
+        double end_time = get_time();
+        
+        double elapsed = end_time - start_time;
+        double latency_ns = (elapsed * 1e9) / accesses_this_sample;
+        
+        samples[num_samples++] = latency_ns;
+        total_accesses += accesses_this_sample;
+        
+        /* Check if we have enough samples and they're stable */
+        if (num_samples >= LATENCY_MIN_SAMPLES) {
+            double mean = calculate_mean(samples, num_samples);
+            double stddev = calculate_stddev(samples, num_samples, mean);
+            double cv = (mean > 0) ? (stddev / mean) : 1.0;
+            
+            /* Stop if coefficient of variation is acceptable */
+            if (cv < LATENCY_TARGET_CV) {
+                break;
+            }
+        }
+    }
+    
+    /* Calculate final statistics */
+    double mean = calculate_mean(samples, num_samples);
+    double stddev = calculate_stddev(samples, num_samples, mean);
+    
+    /* Sort for median calculation */
+    qsort(samples, num_samples, sizeof(double), compare_double);
+    double median = calculate_median(samples, num_samples);
+    
+    /* Populate result */
+    stats.median_ns = median;
+    stats.mean_ns = mean;
+    stats.stddev_ns = stddev;
+    stats.cv = (mean > 0) ? (stddev / mean) : 0;
+    stats.num_samples = num_samples;
+    stats.total_accesses = total_accesses;
+    
+    /* Cleanup */
+    free_latency_chain(start, num_nodes);
+    
+    return stats;
+}
+
+/* Legacy wrapper for compatibility with existing code paths */
 static void init_pointer_chain(void **buf, size_t count) {
+    /* This function is kept for backward compatibility but
+     * the new code path uses init_latency_chain() instead */
     if (count < 2) return;
     
-    /* Create array of indices and shuffle it (Fisher-Yates) */
     size_t *indices = malloc(count * sizeof(size_t));
     if (!indices) {
-        /* Fallback to sequential if malloc fails */
         for (size_t i = 0; i < count - 1; i++) {
             buf[i] = &buf[i + 1];
         }
@@ -288,7 +578,6 @@ static void init_pointer_chain(void **buf, size_t count) {
         indices[i] = i;
     }
     
-    /* Fisher-Yates shuffle on indices */
     for (size_t i = count - 1; i > 0; i--) {
         size_t j = (size_t)rand() % (i + 1);
         size_t tmp = indices[i];
@@ -296,21 +585,19 @@ static void init_pointer_chain(void **buf, size_t count) {
         indices[j] = tmp;
     }
     
-    /* Build chain: element at indices[i] points to element at indices[i+1] */
     for (size_t i = 0; i < count - 1; i++) {
         buf[indices[i]] = &buf[indices[i + 1]];
     }
-    buf[indices[count - 1]] = &buf[indices[0]];  /* Close the loop */
+    buf[indices[count - 1]] = &buf[indices[0]];
     
     free(indices);
 }
 
-/* Chase pointers - each load depends on previous (true latency measurement) */
+/* Legacy chase function for thread worker compatibility */
 static inline __attribute__((always_inline))
 void* mem_latency_chase(void *start, size_t accesses) {
     void **p = (void **)start;
     
-    /* Unroll to reduce loop overhead but maintain dependency chain */
     size_t i = accesses;
     while (i >= 8) {
         p = (void **)*p;
@@ -329,135 +616,6 @@ void* mem_latency_chase(void *start, size_t accesses) {
     }
     
     return p;
-}
-
-/* Adaptive latency measurement with early termination for series tests.
- * 
- * Strategy:
- * 1. First, traverse at least prev_size worth of accesses (warm up past known cache levels)
- * 2. Then measure in chunks, computing moving average latency
- * 3. Stop when latency has stabilized (plateau detected)
- * 
- * Returns: measured latency in nanoseconds, updates total_accesses with actual count
- */
-static double mem_latency_adaptive(void *start, size_t buf_count, 
-                                   size_t prev_size, double prev_latency_ns,
-                                   size_t *total_accesses) {
-    void **p = (void **)start;
-    
-    /* Minimum accesses: at least traverse past the previous buffer size */
-    size_t min_accesses = prev_size / sizeof(void*);
-    if (min_accesses < 1000) min_accesses = 1000;
-    
-    /* Chunk size for measurement (~100K accesses per chunk, ~10ms at 100ns latency) */
-    size_t chunk_size = 100000;
-    
-    /* Maximum accesses (traverse entire buffer 3 times) */
-    size_t max_accesses = buf_count * 3;
-    if (max_accesses < min_accesses * 2) max_accesses = min_accesses * 2;
-    
-    /* Convergence parameters */
-    #define LATENCY_WINDOW 5
-    double recent_latencies[LATENCY_WINDOW] = {0};
-    int window_idx = 0;
-    int stable_count = 0;
-    double converged_latency = 0;
-    
-    /* Do minimum accesses first (no timing, just warm up) */
-    double warmup_start = get_time();
-    size_t warmup_accesses = min_accesses;
-    while (warmup_accesses >= 8) {
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        warmup_accesses -= 8;
-    }
-    while (warmup_accesses > 0) {
-        p = (void **)*p;
-        warmup_accesses--;
-    }
-    double warmup_end = get_time();
-    double warmup_latency = (warmup_end - warmup_start) * 1e9 / min_accesses;
-    
-    /* Initialize window with warmup latency */
-    for (int i = 0; i < LATENCY_WINDOW; i++) {
-        recent_latencies[i] = warmup_latency;
-    }
-    
-    /* Now measure in chunks, checking for convergence */
-    size_t accesses_done = min_accesses;
-    
-    while (accesses_done < max_accesses) {
-        double chunk_start = get_time();
-        
-        /* Chase for one chunk */
-        size_t remaining = chunk_size;
-        while (remaining >= 8) {
-            p = (void **)*p;
-            p = (void **)*p;
-            p = (void **)*p;
-            p = (void **)*p;
-            p = (void **)*p;
-            p = (void **)*p;
-            p = (void **)*p;
-            p = (void **)*p;
-            remaining -= 8;
-        }
-        while (remaining > 0) {
-            p = (void **)*p;
-            remaining--;
-        }
-        
-        double chunk_end = get_time();
-        double chunk_latency = (chunk_end - chunk_start) * 1e9 / chunk_size;
-        accesses_done += chunk_size;
-        
-        /* Update sliding window */
-        recent_latencies[window_idx] = chunk_latency;
-        window_idx = (window_idx + 1) % LATENCY_WINDOW;
-        
-        /* Compute average and check for stability */
-        double avg = 0, min_lat = 1e12, max_lat = 0;
-        for (int i = 0; i < LATENCY_WINDOW; i++) {
-            avg += recent_latencies[i];
-            if (recent_latencies[i] < min_lat) min_lat = recent_latencies[i];
-            if (recent_latencies[i] > max_lat) max_lat = recent_latencies[i];
-        }
-        avg /= LATENCY_WINDOW;
-        
-        /* Check if latency is stable (within 10% spread) and significantly
-         * different from previous level (or we've done enough) */
-        double spread = (max_lat - min_lat) / avg;
-        int is_stable = (spread < 0.10);
-        
-        /* Also check if we've diverged from previous latency (new cache level) */
-        int diverged_from_prev = (prev_latency_ns > 0 && avg > prev_latency_ns * 1.3);
-        
-        if (is_stable) {
-            stable_count++;
-            converged_latency = avg;
-            
-            /* Need 3 stable chunks AND either diverged or done enough */
-            if (stable_count >= 3 && (diverged_from_prev || accesses_done >= min_accesses * 3)) {
-                break;
-            }
-        } else {
-            stable_count = 0;
-        }
-    }
-    
-    /* Store final pointer to prevent optimization */
-    g_sink = (uint64_t)(uintptr_t)p;
-    
-    *total_accesses = accesses_done;
-    return (converged_latency > 0) ? converged_latency : warmup_latency;
-    
-    #undef LATENCY_WINDOW
 }
 
 /* ============================================================================
@@ -1450,19 +1608,23 @@ static size_t* get_sizes(int *count) {
 }
 
 static void print_csv_header(void) {
-    printf("size_kb,operation,bandwidth_mb_s,latency_ns,threads,iterations,elapsed_s\n");
+    printf("size_kb,operation,bandwidth_mb_s,latency_ns,latency_stddev_ns,latency_samples,threads,iterations,elapsed_s\n");
 }
 
 static void print_result(const result_t *r) {
     size_t size_kb = r->size / 1024;
     if (r->op == OP_LATENCY) {
-        /* For latency test, bandwidth is 0, latency has value */
-        printf("%zu,%s,0,%.2f,%d,%d,%.6f\n",
-               size_kb, OP_NAMES[r->op], r->latency_ns,
+        /* For latency test: report median, stddev, and sample count for statistical validity
+         * Median is robust to outliers and provides reliable central tendency
+         * StdDev indicates measurement precision
+         * Sample count shows measurement effort */
+        printf("%zu,%s,0,%.2f,%.2f,%d,%d,%d,%.6f\n",
+               size_kb, OP_NAMES[r->op], r->latency_ns, 
+               r->latency_stddev_ns, r->latency_samples,
                r->threads, r->iterations, r->elapsed_s);
     } else {
-        /* For bandwidth tests, latency is 0 */
-        printf("%zu,%s,%.2f,0,%d,%d,%.6f\n",
+        /* For bandwidth tests, latency fields are 0 */
+        printf("%zu,%s,%.2f,0,0,0,%d,%d,%.6f\n",
                size_kb, OP_NAMES[r->op], r->bandwidth_mb_s,
                r->threads, r->iterations, r->elapsed_s);
     }
@@ -1491,7 +1653,7 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
     best.size = buffer_size;
     best.op = op;
     
-    /* For latency test: single-thread only */
+    /* For latency test: single-thread, statistically valid measurement */
     if (op == OP_LATENCY) {
         /* Cap buffer size for very large latency tests */
         size_t max_latency = MAX_LATENCY_SIZE;
@@ -1500,57 +1662,21 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
         }
         size_t latency_size = (buffer_size > max_latency) ? max_latency : buffer_size;
         
-        /* Use adaptive early termination for series tests (not single-size mode)
-         * when:
-         * - We have previous latency data
-         * - Current size is larger than previous
-         * - Current size is > 1.5GB (safely past even AMD EPYC 9754's 1.1GB L3)
-         * - Previous latency indicates we're already in DRAM territory (> 50ns)
-         */
-        int in_dram_region = (g_prev_latency_ns > 50.0);
-        int past_l3_cache = (latency_size > 1536UL * 1024 * 1024);  /* 1.5 GB */
+        /* Use new statistically valid measurement */
+        double start = get_time();
+        latency_stats_t stats = measure_latency_stats(latency_size);
+        double elapsed = get_time() - start;
         
-        if (g_single_size == 0 && g_prev_latency_ns > 0 && 
-            latency_size > g_prev_latency_size && past_l3_cache && in_dram_region) {
-            /* Adaptive latency measurement */
-            void *buf = alloc_buffer(latency_size);
-            if (buf) {
-                size_t count = latency_size / sizeof(void*);
-                if (count < 2) count = 2;
-                init_pointer_chain((void**)buf, count);
-                
-                size_t actual_accesses = 0;
-                double start = get_time();
-                double latency = mem_latency_adaptive(buf, count,
-                                                      g_prev_latency_size, g_prev_latency_ns,
-                                                      &actual_accesses);
-                double elapsed = get_time() - start;
-                
-                free_buffer(buf, latency_size);
-                
-                best.size = buffer_size;
-                best.op = op;
-                best.threads = 1;
-                best.latency_ns = latency;
-                best.elapsed_s = elapsed;
-                best.iterations = (int)(actual_accesses / count);
-                if (best.iterations < 1) best.iterations = 1;
-                
-                /* Update tracking for next test */
-                g_prev_latency_ns = latency;
-                g_prev_latency_size = latency_size;
-                
-                return best;
-            }
-        }
-        
-        /* Standard latency measurement */
-        best = run_benchmark_best(latency_size, op, 1);
-        best.size = buffer_size;  /* Report requested size */
-        
-        /* Update tracking for next test */
-        g_prev_latency_ns = best.latency_ns;
-        g_prev_latency_size = latency_size;
+        best.size = buffer_size;
+        best.op = op;
+        best.threads = 1;
+        best.latency_ns = stats.median_ns;       /* Use median (robust to outliers) */
+        best.latency_mean_ns = stats.mean_ns;
+        best.latency_stddev_ns = stats.stddev_ns;
+        best.latency_cv = stats.cv;
+        best.latency_samples = stats.num_samples;
+        best.elapsed_s = elapsed;
+        best.iterations = stats.num_samples;
         
         return best;
     }
@@ -1613,10 +1739,6 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
 
 static void run_all_benchmarks(void) {
     double start_time = get_time();
-    
-    /* Reset adaptive latency tracking for this run */
-    g_prev_latency_ns = 0;
-    g_prev_latency_size = 0;
     
     /* Get thread counts */
     int tc_count;
@@ -1745,12 +1867,18 @@ static void usage(const char *prog) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Output: CSV to stdout with columns:\n");
     fprintf(stderr, "  size_kb        - Per-thread buffer size (KB)\n");
-    fprintf(stderr, "  operation      - read, write, copy, or latency\n");
-    fprintf(stderr, "  bandwidth_mb_s - Aggregate bandwidth in MB/s (0 for latency)\n");
-    fprintf(stderr, "  latency_ns     - Memory latency in nanoseconds (0 for bandwidth)\n");
-    fprintf(stderr, "  threads        - Thread count used\n");
-    fprintf(stderr, "  iterations     - Iterations performed\n");
-    fprintf(stderr, "  elapsed_s      - Elapsed time in seconds\n");
+    fprintf(stderr, "  operation         - read, write, copy, or latency\n");
+    fprintf(stderr, "  bandwidth_mb_s    - Aggregate bandwidth in MB/s (0 for latency)\n");
+    fprintf(stderr, "  latency_ns        - Median memory latency in ns (0 for bandwidth)\n");
+    fprintf(stderr, "  latency_stddev_ns - Latency standard deviation in ns (0 for bandwidth)\n");
+    fprintf(stderr, "  latency_samples   - Number of samples for latency measurement\n");
+    fprintf(stderr, "  threads           - Thread count used\n");
+    fprintf(stderr, "  iterations        - Iterations performed\n");
+    fprintf(stderr, "  elapsed_s         - Elapsed time in seconds\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Latency measurement uses linked list traversal with random node order\n");
+    fprintf(stderr, "to defeat prefetchers. Statistical validity ensured via multiple samples\n");
+    fprintf(stderr, "until coefficient of variation < 5%% or max samples reached.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Memory model: each thread gets its own buffer.\n");
     fprintf(stderr, "Total memory = size_kb × threads (×2 for copy: src + dst).\n");
