@@ -14,7 +14,7 @@
 #   hwloc:    libhwloc-dev (Debian/Ubuntu), hwloc-devel (RHEL/CentOS), hwloc (macOS)
 #   NUMA:     libnuma-dev (Debian/Ubuntu), numactl-devel (RHEL/CentOS)
 
-CC = gcc
+CC? = gcc
 CFLAGS = -O3 -Wall -Wextra -std=c11 -march=native
 LDFLAGS = -pthread -lm -lhugetlbfs
 
