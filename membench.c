@@ -2,6 +2,7 @@
  * sc-membench - Portable Memory Bandwidth and Latency Benchmark
  *
  * A multi-platform memory benchmark that:
+ * - Works on Linux, macOS, FreeBSD, and other Unix-like systems
  * - Works on x86, arm64, and other architectures
  * - Measures read, write, and copy bandwidth
  * - Measures memory latency using pointer chasing
@@ -10,10 +11,16 @@
  * - Finds optimal thread count for peak bandwidth
  * - Outputs CSV format for analysis
  *
- * Compile:
- *   gcc -O3 -pthread -o membench membench.c -lm -lhugetlbfs
- *   # With NUMA support (optional):
- *   gcc -O3 -pthread -DUSE_NUMA -o membench membench.c -lnuma -lm -lhugetlbfs
+ * Compile (recommended - use make for auto-detection):
+ *   make              # Auto-detect available features
+ *   make basic        # Minimal build, no optional dependencies
+ *   make full         # All features (Linux: hwloc + numa + hugetlbfs)
+ *
+ * Manual compilation:
+ *   gcc -O3 -pthread -o membench membench.c -lm
+ *   # With optional libraries:
+ *   gcc -O3 -pthread -DUSE_HWLOC -DUSE_NUMA -DHAVE_HUGETLBFS \
+ *       -o membench membench.c -lm -lhwloc -lnuma -lhugetlbfs
  *
  * Usage:
  *   ./membench [options]
@@ -23,7 +30,24 @@
  * Licensed under Mozilla Public License 2.0
  */
 
+/* Platform detection (may be overridden by compiler flags) */
+#if !defined(PLATFORM_LINUX) && !defined(PLATFORM_MACOS) && !defined(PLATFORM_BSD)
+    #if defined(__linux__)
+        #define PLATFORM_LINUX
+    #elif defined(__APPLE__) && defined(__MACH__)
+        #define PLATFORM_MACOS
+    #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+        #define PLATFORM_BSD
+    #endif
+#endif
+
+/* Enable GNU extensions on Linux for CPU affinity (must be before includes) */
+#ifdef PLATFORM_LINUX
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,11 +57,33 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <math.h>
-#include <hugetlbfs.h>
 
+/* Platform-specific includes */
+#ifdef PLATFORM_LINUX
+#include <sched.h>
+#endif
+
+#ifdef PLATFORM_BSD
+#include <sys/param.h>
+#include <sys/cpuset.h>
+#include <sys/sysctl.h>
+#include <pthread_np.h>
+#endif
+
+#ifdef PLATFORM_MACOS
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+#endif
+
+/* Optional library: libhugetlbfs (Linux only, for huge page size detection) */
+#if defined(HAVE_HUGETLBFS) && defined(PLATFORM_LINUX)
+#include <hugetlbfs.h>
+#endif
+
+/* Optional library: NUMA support (Linux only) */
 #ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
@@ -65,15 +111,60 @@
 #define RAM_SIZE_1 (64UL * 1024 * 1024)   /* 64 MB - definitely past any L3 */
 #define RAM_SIZE_2 (256UL * 1024 * 1024)  /* 256 MB - more RAM data points */
 
-/* Get huge page size dynamically from the system via libhugetlbfs.
- * Returns the default huge page size (typically 2MB on x86, varies on ARM).
- * Falls back to 2MB if the library call fails. */
+/* Get huge page size dynamically from the system.
+ * Tries multiple methods in order of reliability:
+ *   1. libhugetlbfs (if available, most reliable)
+ *   2. /proc/meminfo (Linux)
+ *   3. sysctl (macOS/BSD)
+ *   4. Default fallback (2MB for x86, common size)
+ * Returns the default huge page size (typically 2MB on x86, varies on ARM). */
 static size_t get_huge_page_size(void) {
     static size_t cached_size = 0;
-    if (cached_size == 0) {
-        long size = gethugepagesize();
-        cached_size = (size > 0) ? (size_t)size : (2UL * 1024 * 1024);
+    if (cached_size != 0) return cached_size;
+
+#if defined(HAVE_HUGETLBFS) && defined(PLATFORM_LINUX)
+    /* Method 1: libhugetlbfs (most reliable on Linux) */
+    long size = gethugepagesize();
+    if (size > 0) {
+        cached_size = (size_t)size;
+        return cached_size;
     }
+#endif
+
+#ifdef PLATFORM_LINUX
+    /* Method 2: Parse /proc/meminfo */
+    FILE *file = fopen("/proc/meminfo", "r");
+    if (file) {
+        char line[256];
+        unsigned long size_kb = 0;
+        while (fgets(line, sizeof(line), file)) {
+            if (sscanf(line, "Hugepagesize: %lu kB", &size_kb) == 1) {
+                cached_size = size_kb * 1024;
+                fclose(file);
+                return cached_size;
+            }
+        }
+        fclose(file);
+    }
+#endif
+
+#if defined(PLATFORM_MACOS) || defined(PLATFORM_BSD)
+    /* Method 3: sysctl for macOS/BSD (get VM page size, huge pages vary) */
+    /* Note: macOS doesn't have traditional huge pages like Linux,
+     * but we can use vm.pagesize as a reference. Superpage support varies. */
+    int mib[2] = { CTL_HW, HW_PAGESIZE };
+    int pagesize = 0;
+    size_t len = sizeof(pagesize);
+    if (sysctl(mib, 2, &pagesize, &len, NULL, 0) == 0 && pagesize > 0) {
+        /* On macOS, superpage size is typically 2MB on Intel, 16KB on ARM
+         * but there's no standard API to query it. Use 2MB as common default. */
+        cached_size = 2UL * 1024 * 1024;
+        return cached_size;
+    }
+#endif
+
+    /* Method 4: Default fallback (2MB, most common huge page size) */
+    cached_size = 2UL * 1024 * 1024;
     return cached_size;
 }
 
@@ -503,16 +594,44 @@ static void free_latency_chain(LatencyNode *start, size_t num_nodes, size_t allo
     free_latency_memory(min_addr, alloc_size);
 }
 
-/* Pin current thread to CPU 0 for consistent latency measurement */
+/* Pin current thread to CPU 0 for consistent latency measurement.
+ * Platform-specific implementations for Linux, macOS, and BSD. */
 static void pin_thread_to_cpu0(void) {
+    int success = 0;
+    
+#ifdef PLATFORM_LINUX
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);  /* 0 = current thread */
-    
+    success = (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0);
+#endif
+
+#ifdef PLATFORM_BSD
+    cpuset_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    success = (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                                   sizeof(cpuset), &cpuset) == 0);
+#endif
+
+#ifdef PLATFORM_MACOS
+    /* macOS doesn't have true CPU affinity, but we can suggest affinity
+     * via thread_policy_set with THREAD_AFFINITY_POLICY.
+     * This is a hint, not a guarantee. */
+    thread_affinity_policy_data_t policy = { 0 };  /* Affinity tag 0 */
+    success = (thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
+                                 (thread_policy_t)&policy, 
+                                 THREAD_AFFINITY_POLICY_COUNT) == KERN_SUCCESS);
+#endif
+
     if (g_verbose >= 2) {
-        fprintf(stderr, "  Latency thread pinned to CPU 0\n");
+        if (success) {
+            fprintf(stderr, "  Latency thread pinned to CPU 0\n");
+        } else {
+            fprintf(stderr, "  Warning: Could not pin thread to CPU 0\n");
+        }
     }
+    (void)success;  /* Suppress unused warning if no platform matched */
 }
 
 /* Chase through linked list - each load depends on previous
@@ -845,11 +964,11 @@ static void* alloc_buffer(size_t size) {
          * deterministic (guaranteed 2MB pages vs THP's best-effort).
          */
         
+#ifdef MAP_HUGETLB
         /* Round up size to huge page boundary for explicit huge pages */
         size_t hp_size = get_huge_page_size();
         size_t aligned_size = (size + hp_size - 1) & ~(hp_size - 1);
         
-#ifdef MAP_HUGETLB
         /* Try explicit huge pages (uses pre-allocated pool if available) */
         buf = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -1002,8 +1121,9 @@ static void cleanup_hwloc(void) {
     }
 }
 
-#else /* !USE_HWLOC - fallback to sysfs parsing */
+#else /* !USE_HWLOC - fallback to platform-specific methods */
 
+#ifdef PLATFORM_LINUX
 /* Parse cache size from sysfs (handles "48K", "1024K", "32768K" format) */
 static size_t parse_cache_size_sysfs(const char *str) {
     size_t size = 0;
@@ -1015,13 +1135,12 @@ static size_t parse_cache_size_sysfs(const char *str) {
     return size;
 }
 
-/* Read cache info from sysfs */
-static void init_cache_info(void) {
+/* Read cache info from sysfs (Linux-specific) */
+static void init_cache_info_linux(void) {
     char path[256];
     char buf[64];
     FILE *f;
     
-    /* Try to read cache info from sysfs (Linux) */
     for (int index = 0; index < 10; index++) {
         /* Read level */
         snprintf(path, sizeof(path), 
@@ -1062,6 +1181,75 @@ static void init_cache_info(void) {
             case 3: if (g_l3_cache_size == 0) g_l3_cache_size = size; break;
         }
     }
+}
+#endif /* PLATFORM_LINUX */
+
+#ifdef PLATFORM_MACOS
+/* Read cache info from sysctl (macOS-specific) */
+static void init_cache_info_macos(void) {
+    size_t size;
+    size_t len = sizeof(size);
+    
+    /* L1 data cache */
+    if (sysctlbyname("hw.l1dcachesize", &size, &len, NULL, 0) == 0 && size > 0) {
+        g_l1_cache_size = size;
+    }
+    
+    /* L2 cache */
+    len = sizeof(size);
+    if (sysctlbyname("hw.l2cachesize", &size, &len, NULL, 0) == 0 && size > 0) {
+        g_l2_cache_size = size;
+    }
+    
+    /* L3 cache (may not exist on all Macs) */
+    len = sizeof(size);
+    if (sysctlbyname("hw.l3cachesize", &size, &len, NULL, 0) == 0 && size > 0) {
+        g_l3_cache_size = size;
+    }
+}
+#endif /* PLATFORM_MACOS */
+
+#ifdef PLATFORM_BSD
+/* Read cache info from sysctl (BSD-specific) */
+static void init_cache_info_bsd(void) {
+    /* FreeBSD and other BSDs have limited sysctl cache info.
+     * Try standard hw.cacheXXX values, fall back to defaults. */
+    size_t size;
+    size_t len = sizeof(size);
+    
+    /* Try various BSD sysctl names */
+    if (sysctlbyname("hw.l1dcachesize", &size, &len, NULL, 0) == 0 && size > 0) {
+        g_l1_cache_size = size;
+    }
+    len = sizeof(size);
+    if (sysctlbyname("hw.l2cachesize", &size, &len, NULL, 0) == 0 && size > 0) {
+        g_l2_cache_size = size;
+    }
+    len = sizeof(size);
+    if (sysctlbyname("hw.l3cachesize", &size, &len, NULL, 0) == 0 && size > 0) {
+        g_l3_cache_size = size;
+    }
+}
+#endif /* PLATFORM_BSD */
+
+/* Platform-agnostic cache info initialization */
+static void init_cache_info(void) {
+    const char *method = "defaults";
+    
+#ifdef PLATFORM_LINUX
+    init_cache_info_linux();
+    method = "sysfs";
+#endif
+
+#ifdef PLATFORM_MACOS
+    init_cache_info_macos();
+    method = "sysctl";
+#endif
+
+#ifdef PLATFORM_BSD
+    init_cache_info_bsd();
+    method = "sysctl";
+#endif
     
     /* Set defaults if detection failed */
     if (g_l1_cache_size == 0) g_l1_cache_size = 32 * 1024;      /* 32 KB */
@@ -1073,8 +1261,9 @@ static void init_cache_info(void) {
     g_min_total_size = 16384 * g_num_cpus;  /* 16KB per thread minimum */
     
     if (g_verbose) {
-        fprintf(stderr, "Cache (sysfs): L1d=%zuKB, L2=%zuKB, L3=%zuKB (per core)\n",
-                g_l1_cache_size / 1024, g_l2_cache_size / 1024, g_l3_cache_size / 1024);
+        fprintf(stderr, "Cache (%s): L1d=%zuKB, L2=%zuKB, L3=%zuKB (per core)\n",
+                method, g_l1_cache_size / 1024, g_l2_cache_size / 1024, 
+                g_l3_cache_size / 1024);
         fprintf(stderr, "Minimum total test size: %zu KB (16KB × %d CPUs)\n",
                 g_min_total_size / 1024, g_num_cpus);
     }
@@ -1179,17 +1368,56 @@ static void init_numa(void) {
  * ============================================================================ */
 
 static void init_system_info(void) {
-    /* Get number of CPUs */
+    /* Get number of CPUs (POSIX, works on all platforms) */
     g_num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (g_num_cpus < 1) g_num_cpus = 1;
     
-    /* Get total memory */
+    /* Get total memory (platform-specific methods) */
+    g_total_memory = 0;
+    
+#ifdef PLATFORM_LINUX
+    /* Linux: sysconf is reliable */
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page_size > 0) {
         g_total_memory = (size_t)pages * (size_t)page_size;
+    }
+#endif
+
+#ifdef PLATFORM_MACOS
+    /* macOS: use sysctl hw.memsize */
+    int64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0 && memsize > 0) {
+        g_total_memory = (size_t)memsize;
+    }
+#endif
+
+#ifdef PLATFORM_BSD
+    /* BSD: try hw.physmem or hw.realmem */
+    unsigned long physmem = 0;
+    size_t len = sizeof(physmem);
+    if (sysctlbyname("hw.physmem", &physmem, &len, NULL, 0) == 0 && physmem > 0) {
+        g_total_memory = (size_t)physmem;
     } else {
-        g_total_memory = 1024UL * 1024 * 1024;  /* Default 1GB */
+        /* Fallback to sysconf */
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page_size > 0) {
+            g_total_memory = (size_t)pages * (size_t)page_size;
+        }
+    }
+#endif
+
+    /* Fallback if detection failed */
+    if (g_total_memory == 0) {
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page_size > 0) {
+            g_total_memory = (size_t)pages * (size_t)page_size;
+        } else {
+            g_total_memory = 1024UL * 1024 * 1024;  /* Default 1GB */
+        }
     }
     
     if (g_verbose) {

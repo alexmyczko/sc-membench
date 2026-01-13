@@ -64,7 +64,7 @@ docker run --rm --privileged ghcr.io/sparecores/membench:main -H > results.csv
 
 ```bash
 make              # Basic version (sysfs cache detection, Linux only)
-make hwloc        # With hwloc (recommended - portable cache detection)
+make hwloc        # With hwloc 2 (recommended - portable cache detection)
 make numa         # With NUMA support
 make full         # With hwloc + NUMA (recommended for servers)
 make all          # Build all versions
@@ -231,8 +231,8 @@ With `-f` (full sweep), additional larger sizes are tested up to the memory limi
 
 ### Cache Detection
 
-With hwloc (recommended), cache sizes are detected automatically on any platform.
-Without hwloc, the benchmark parses `/sys/devices/system/cpu/*/cache/` (Linux only).
+With hwloc 2 (recommended), cache sizes are detected automatically on any platform.
+Without hwloc, the benchmark uses sysctl (macOS/BSD) or parses `/sys/devices/system/cpu/*/cache/` (Linux).
 
 If cache detection fails, sensible defaults are used (32KB L1, 256KB L2, 8MB L3).
 
@@ -600,32 +600,39 @@ Typical modern systems:
 
 ## Dependencies
 
-- **Required**: POSIX threads (pthread), C11 compiler
-- **Recommended**: libhwloc for portable cache topology detection
-- **Optional**: libnuma for NUMA support
+- **Required**: POSIX threads (pthread), C11 compiler (gcc or clang)
+- **Recommended**: hwloc 2.x for portable cache topology detection
+- **Optional**: libnuma for NUMA support (Linux only)
+- **Optional**: libhugetlbfs for huge page size detection (Linux only)
 
 ### Installing Dependencies
 
 ```bash
 # Debian/Ubuntu
-apt-get install build-essential libhwloc-dev libnuma-dev
+apt-get install build-essential libhwloc-dev libnuma-dev libhugetlbfs-dev
 
 # RHEL/CentOS/Fedora
-yum install gcc make hwloc-devel numactl-devel
+yum install gcc make hwloc-devel numactl-devel libhugetlbfs-devel
 
 # macOS (hwloc only, no NUMA)
 brew install hwloc
 xcode-select --install
+
+# FreeBSD (hwloc 2 required, not hwloc 1)
+pkg install gmake hwloc2
 ```
 
 ### What Each Dependency Provides
 
 | Library | Purpose | Platforms |
 |---------|---------|-----------|
-| **hwloc** | Cache topology detection (L1/L2/L3 sizes) | Linux, macOS, Windows, BSD |
+| **hwloc 2** | Cache topology detection (L1/L2/L3 sizes) | Linux, macOS, BSD |
 | **libnuma** | NUMA-aware memory allocation | Linux only |
+| **libhugetlbfs** | Huge page size detection | Linux only |
 
-Without hwloc, the benchmark falls back to parsing `/sys/devices/system/cpu/*/cache/` (Linux only).
+**Note**: hwloc 2.x is required. hwloc 1.x uses a different API and is not supported.
+
+Without hwloc, the benchmark falls back to sysctl (macOS/BSD) or `/sys/devices/system/cpu/*/cache/` (Linux).
 Without libnuma, memory is allocated without NUMA awareness (may underperform on multi-socket systems).
 
 ## License
@@ -636,4 +643,5 @@ Mozilla Public License 2.0
 
 - [STREAM benchmark](https://www.cs.virginia.edu/stream/)
 - [lmbench](https://sourceforge.net/projects/lmbench/)
+- [ram_bench](https://github.com/emilk/ram_bench)
 
