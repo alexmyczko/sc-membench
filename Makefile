@@ -1,6 +1,7 @@
 # sc-membench Makefile
 #
 # Portable build system for Linux, macOS, and BSD
+# Uses OpenMP for parallel bandwidth measurement
 #
 # Build options:
 #   make           - Auto-detect features and build optimal version
@@ -30,6 +31,9 @@ CC ?= $(shell command -v gcc 2>/dev/null || command -v clang 2>/dev/null || echo
 # Base flags (portable across gcc/clang)
 CFLAGS_BASE = -O3 -Wall -Wextra -std=c11
 
+# OpenMP flag (same for gcc and clang)
+OPENMP_FLAG = -fopenmp
+
 # Platform-specific adjustments
 # Note: Platform is auto-detected in code, these are just for build optimization
 ifeq ($(UNAME_S),Darwin)
@@ -44,33 +48,45 @@ ifeq ($(UNAME_S),Darwin)
         CFLAGS_PATHS = -I/usr/local/include
         LDFLAGS_PATHS = -L/usr/local/lib
     endif
-    LDFLAGS_BASE = -pthread -lm
+    # macOS with clang needs libomp
+    LDFLAGS_BASE = -lm
+    # Check if using clang (needs -lomp for OpenMP)
+    IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -q clang && echo yes)
+    ifeq ($(IS_CLANG),yes)
+        OPENMP_LIBS = -lomp
+    else
+        OPENMP_LIBS =
+    endif
 else ifeq ($(UNAME_S),FreeBSD)
     # FreeBSD: packages in /usr/local
     CFLAGS_ARCH = -march=native
     CFLAGS_PATHS = -I/usr/local/include
     LDFLAGS_PATHS = -L/usr/local/lib
-    LDFLAGS_BASE = -pthread -lm
+    LDFLAGS_BASE = -lm
+    OPENMP_LIBS =
 else ifeq ($(UNAME_S),OpenBSD)
     CFLAGS_ARCH = -march=native
     CFLAGS_PATHS = -I/usr/local/include
     LDFLAGS_PATHS = -L/usr/local/lib
-    LDFLAGS_BASE = -pthread -lm
+    LDFLAGS_BASE = -lm
+    OPENMP_LIBS =
 else ifeq ($(UNAME_S),NetBSD)
     CFLAGS_ARCH = -march=native
     CFLAGS_PATHS = -I/usr/local/include -I/usr/pkg/include
     LDFLAGS_PATHS = -L/usr/local/lib -L/usr/pkg/lib
-    LDFLAGS_BASE = -pthread -lm
+    LDFLAGS_BASE = -lm
+    OPENMP_LIBS =
 else
     # Linux (default)
     CFLAGS_ARCH = -march=native
     CFLAGS_PATHS =
     LDFLAGS_PATHS =
-    LDFLAGS_BASE = -pthread -lm
+    LDFLAGS_BASE = -lm
+    OPENMP_LIBS =
 endif
 
-CFLAGS = $(CFLAGS_BASE) $(CFLAGS_ARCH) $(CFLAGS_PATHS)
-LDFLAGS = $(LDFLAGS_BASE) $(LDFLAGS_PATHS)
+CFLAGS = $(CFLAGS_BASE) $(CFLAGS_ARCH) $(CFLAGS_PATHS) $(OPENMP_FLAG)
+LDFLAGS = $(OPENMP_FLAG) $(LDFLAGS_BASE) $(LDFLAGS_PATHS) $(OPENMP_LIBS)
 
 # =============================================================================
 # Library Detection
@@ -136,8 +152,9 @@ endif
 $(TARGET): $(SRC)
 	@echo "Building for $(UNAME_S) with auto-detected features..."
 	@echo "  Compiler: $(CC)"
-	@echo "  hwloc: $(HAVE_HWLOC)"
-	@echo "  numa: $(HAVE_NUMA)"
+	@echo "  OpenMP:   enabled"
+	@echo "  hwloc:    $(HAVE_HWLOC)"
+	@echo "  numa:     $(HAVE_NUMA)"
 	@echo "  hugetlbfs: $(HAVE_HUGETLBFS)"
 	$(CC) $(CFLAGS) $(DETECTED_DEFS) -o $@ $< $(LDFLAGS) $(DETECTED_LIBS)
 
@@ -244,7 +261,7 @@ info:
 
 # Help target
 help:
-	@echo "sc-membench - Portable Memory Benchmark"
+	@echo "sc-membench - Portable Memory Benchmark (OpenMP)"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  make          - Auto-detect features and build optimal version"
@@ -255,10 +272,15 @@ help:
 	@echo "  make all      - Build all available versions"
 	@echo "  make info     - Show detected platform and libraries"
 	@echo ""
+	@echo "OpenMP thread control (environment variables):"
+	@echo "  OMP_PROC_BIND=spread    Distribute threads across NUMA nodes"
+	@echo "  OMP_PLACES=cores        One thread per physical core"
+	@echo "  OMP_NUM_THREADS=N       Override thread count"
+	@echo ""
 	@echo "Optional dependencies:"
 	@echo "  hwloc 2:   Portable cache/topology detection (requires hwloc 2.x)"
 	@echo "             Linux: apt install libhwloc-dev"
-	@echo "             macOS: brew install hwloc"
+	@echo "             macOS: brew install hwloc libomp"
 	@echo "             BSD:   pkg install hwloc2"
 	@echo ""
 	@echo "  numa:      NUMA-aware memory allocation (Linux only)"

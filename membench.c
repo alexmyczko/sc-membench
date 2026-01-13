@@ -4,7 +4,7 @@
  * A multi-platform memory benchmark that:
  * - Works on Linux, macOS, FreeBSD, and other Unix-like systems
  * - Works on x86, arm64, and other architectures
- * - Measures read, write, and copy bandwidth
+ * - Measures read, write, and copy bandwidth using OpenMP
  * - Measures memory latency using pointer chasing
  * - Handles NUMA automatically (works on non-NUMA too)
  * - Sweeps through cache and memory sizes
@@ -17,9 +17,9 @@
  *   make full         # All features (Linux: hwloc + numa + hugetlbfs)
  *
  * Manual compilation:
- *   gcc -O3 -pthread -o membench membench.c -lm
+ *   gcc -O3 -fopenmp -o membench membench.c -lm
  *   # With optional libraries:
- *   gcc -O3 -pthread -DUSE_HWLOC -DUSE_NUMA -DHAVE_HUGETLBFS \
+ *   gcc -O3 -fopenmp -DUSE_HWLOC -DUSE_NUMA -DHAVE_HUGETLBFS \
  *       -o membench membench.c -lm -lhwloc -lnuma -lhugetlbfs
  *
  * Usage:
@@ -53,7 +53,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <pthread.h>
+#include <omp.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
@@ -69,7 +69,6 @@
 #include <sys/param.h>
 #include <sys/cpuset.h>
 #include <sys/sysctl.h>
-#include <pthread_np.h>
 #endif
 
 #ifdef PLATFORM_MACOS
@@ -93,7 +92,7 @@
  * Configuration
  * ============================================================================ */
 
-#define VERSION "1.0.3"
+#define VERSION "1.1.0"
 
 /* Target time per individual measurement (seconds) */
 #define TARGET_TIME_PER_TEST 0.25
@@ -189,20 +188,6 @@ typedef enum {
 static const char* OP_NAMES[] = {"read", "write", "copy", "latency"};
 
 typedef struct {
-    void *src;              /* Source buffer (thread-private) */
-    void *dst;              /* Destination buffer for copy (thread-private) */
-    size_t size;            /* Buffer size per thread */
-    operation_t op;         /* Operation type */
-    int iterations;         /* Number of iterations */
-    uint64_t checksum;      /* Prevent optimization */
-    double elapsed;         /* Thread's elapsed time */
-    int thread_id;          /* Logical thread ID (0..nthreads-1) */
-    int cpu_id;             /* Physical CPU ID to pin to */
-    int numa_node;          /* NUMA node to bind to (-1 for no binding) */
-    int ready;              /* Thread ready flag */
-} thread_work_t;
-
-typedef struct {
     size_t size;
     operation_t op;
     int threads;
@@ -220,7 +205,6 @@ typedef struct {
  * Global state
  * ============================================================================ */
 
-static pthread_barrier_t g_barrier;
 static volatile int g_running = 1;
 static int g_verbose = 0;  /* 0=quiet, 1=summary, 2=detailed */
 static int g_full_sweep = 0;      /* If 1, test all sizes up to max; if 0, stop early when converged */
@@ -794,157 +778,6 @@ static latency_stats_t measure_latency_stats(size_t buffer_size) {
     return stats;
 }
 
-/* Legacy wrapper for compatibility with existing code paths */
-static void init_pointer_chain(void **buf, size_t count) {
-    /* This function is kept for backward compatibility but
-     * the new code path uses init_latency_chain() instead */
-    if (count < 2) return;
-    
-    size_t *indices = malloc(count * sizeof(size_t));
-    if (!indices) {
-        for (size_t i = 0; i < count - 1; i++) {
-            buf[i] = &buf[i + 1];
-        }
-        buf[count - 1] = &buf[0];
-        return;
-    }
-    
-    for (size_t i = 0; i < count; i++) {
-        indices[i] = i;
-    }
-    
-    for (size_t i = count - 1; i > 0; i--) {
-        size_t j = (size_t)rand() % (i + 1);
-        size_t tmp = indices[i];
-        indices[i] = indices[j];
-        indices[j] = tmp;
-    }
-    
-    for (size_t i = 0; i < count - 1; i++) {
-        buf[indices[i]] = &buf[indices[i + 1]];
-    }
-    buf[indices[count - 1]] = &buf[indices[0]];
-    
-    free(indices);
-}
-
-/* Legacy chase function for thread worker compatibility */
-static inline __attribute__((always_inline))
-void* mem_latency_chase(void *start, size_t accesses) {
-    void **p = (void **)start;
-    
-    size_t i = accesses;
-    while (i >= 8) {
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        p = (void **)*p;
-        i -= 8;
-    }
-    while (i > 0) {
-        p = (void **)*p;
-        i--;
-    }
-    
-    return p;
-}
-
-/* ============================================================================
- * Thread worker
- * ============================================================================ */
-
-static void* thread_worker(void *arg) {
-    thread_work_t *work = (thread_work_t *)arg;
-    void *src = work->src;
-    void *dst = work->dst;
-    size_t size = work->size;
-    uint64_t checksum = 0;
-    int iterations = work->iterations;
-    
-    /* Pin thread to specific CPU for consistent results.
-     * This prevents the OS scheduler from moving threads between cores,
-     * which causes huge variability in benchmark results.
-     * 
-     * On NUMA systems, threads are distributed evenly across nodes using
-     * get_cpu_for_thread(), so cpu_id is already NUMA-balanced.
-     * 
-     * NOTE: We do NOT call numa_run_on_node() because it would OVERRIDE
-     * the CPU pinning and allow the thread to run on any CPU in that node.
-     * CPU pinning is more precise and gives better consistency. */
-    int cpu = work->cpu_id;
-    if (cpu >= 0 && cpu < g_num_cpus) {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(cpu, &cpuset);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    }
-    
-#ifdef USE_NUMA
-    /* Bind memory to the local NUMA node for this CPU.
-     * This ensures memory is close to where it will be accessed. */
-    if (numa_available() >= 0 && g_numa_nodes > 1 && cpu >= 0) {
-        int node = numa_node_of_cpu(cpu);
-        if (node >= 0) {
-            /* Bind memory to the local node */
-            unsigned long nodemask = 1UL << node;
-            mbind(src, size, MPOL_BIND, &nodemask, g_numa_nodes + 1, MPOL_MF_MOVE);
-            if (dst) mbind(dst, size, MPOL_BIND, &nodemask, g_numa_nodes + 1, MPOL_MF_MOVE);
-        }
-    }
-#endif
-    
-    /* Initialize thread's private buffer (touch all pages) 
-     * Note: For OP_LATENCY, pointer chain is already initialized in run_benchmark */
-    if (work->op != OP_LATENCY) {
-        memset(src, 0xAA, size);
-        if (dst) memset(dst, 0, size);
-    }
-    
-    /* Wait for all threads to be ready */
-    pthread_barrier_wait(&g_barrier);
-    
-    double start = get_time();
-    
-    switch (work->op) {
-        case OP_READ:
-            for (int i = 0; i < iterations; i++) {
-                checksum += mem_read(src, size);
-            }
-            break;
-            
-        case OP_WRITE:
-            for (int i = 0; i < iterations; i++) {
-                mem_write(src, size, (uint64_t)i);
-            }
-            break;
-            
-        case OP_COPY:
-            for (int i = 0; i < iterations; i++) {
-                mem_copy(dst, src, size);
-            }
-            break;
-            
-        case OP_LATENCY: {
-            size_t count = size / sizeof(void*);
-            size_t accesses = count * iterations;
-            void *result = mem_latency_chase(src, accesses);
-            checksum = (uint64_t)(uintptr_t)result;
-            break;
-        }
-    }
-    
-    double end = get_time();
-    
-    work->elapsed = end - start;
-    work->checksum = checksum;
-    
-    return NULL;
-}
-
 /* ============================================================================
  * Memory allocation
  * ============================================================================ */
@@ -1318,26 +1151,6 @@ static void init_numa_topology(void) {
     }
 }
 
-/* Get CPU for thread i, distributing evenly across NUMA nodes */
-static int get_cpu_for_thread(int thread_id, int num_threads) {
-    if (g_numa_nodes <= 1 || num_threads <= 1) {
-        /* UMA or single thread: use sequential assignment */
-        return thread_id % g_num_cpus;
-    }
-    
-    /* NUMA: distribute threads round-robin across nodes */
-    int node = thread_id % g_numa_nodes;
-    int thread_on_node = thread_id / g_numa_nodes;
-    
-    if (g_cpus_per_node[node] == 0) {
-        /* Fallback if node has no CPUs (shouldn't happen) */
-        return thread_id % g_num_cpus;
-    }
-    
-    int cpu_idx = thread_on_node % g_cpus_per_node[node];
-    return g_node_cpus[node][cpu_idx];
-}
-
 static void init_numa(void) {
 #ifdef USE_NUMA
     if (numa_available() >= 0) {
@@ -1430,328 +1243,309 @@ static void init_system_info(void) {
 }
 
 /* ============================================================================
- * Benchmark runner
+ * OpenMP Bandwidth Benchmark
  * ============================================================================ */
 
 /* 
- * Run benchmark dynamically until both conditions are met:
- * 1. At least MIN_ITERATIONS completed
- * 2. At least TARGET_TIME_PER_TEST elapsed
+ * Run bandwidth benchmark using OpenMP.
  * 
- * This ensures small buffers run long enough for accuracy,
- * while large buffers don't run excessively.
- * Used for single-threaded path.
+ * Key features:
+ * - proc_bind(spread) distributes threads across NUMA nodes
+ * - Per-thread NUMA-local buffer allocation
+ * - Implicit barrier synchronization (more efficient than pthread_barrier)
+ * - 8-accumulator read for optimal bandwidth measurement
  */
-typedef struct {
-    int iterations;
-    double elapsed;
-    uint64_t checksum;
-} dynamic_result_t;
-
-static dynamic_result_t run_dynamic_benchmark(void *src, void *dst, size_t size, operation_t op) {
-    dynamic_result_t result = {0, 0.0, 0};
-    uint64_t checksum = 0;
-    int iterations = 0;
-    
-    /* Warmup pass */
-    switch (op) {
-        case OP_READ:
-            checksum += mem_read(src, size);
-            break;
-        case OP_WRITE:
-            mem_write(src, size, 0x1234567890ABCDEFULL);
-            break;
-        case OP_COPY:
-            mem_copy(dst, src, size);
-            break;
-        case OP_LATENCY: {
-            size_t count = size / sizeof(void*);
-            checksum += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
-            break;
-        }
-    }
-    
-    double start = get_time();
-    
-    /* Run until both MIN_ITERATIONS and TARGET_TIME are satisfied */
-    while (1) {
-        switch (op) {
-            case OP_READ:
-                checksum += mem_read(src, size);
-                break;
-            case OP_WRITE:
-                mem_write(src, size, (uint64_t)iterations);
-                break;
-            case OP_COPY:
-                mem_copy(dst, src, size);
-                break;
-            case OP_LATENCY: {
-                size_t count = size / sizeof(void*);
-                checksum += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
-                break;
-            }
-        }
-        iterations++;
-        
-        double elapsed = get_time() - start;
-        
-        /* Stop when BOTH conditions are met */
-        if (iterations >= MIN_ITERATIONS && elapsed >= TARGET_TIME_PER_TEST) {
-            result.elapsed = elapsed;
-            break;
-        }
-        
-        /* Safety limit */
-        if (iterations >= MAX_ITERATIONS) {
-            result.elapsed = elapsed;
-            break;
-        }
-    }
-    
-    result.iterations = iterations;
-    result.checksum = checksum;
-    return result;
-}
-
-/* 
- * Calibrate iterations for multi-threaded tests.
- * For multi-threaded, all threads must run the same number of iterations,
- * so we pre-calculate based on a calibration run.
- */
-static int calibrate_iterations(void *src, void *dst, size_t size, operation_t op) {
-    /* Warmup pass */
-    switch (op) {
-        case OP_READ:
-            g_sink += mem_read(src, size);
-            break;
-        case OP_WRITE:
-            mem_write(src, size, 0x1234567890ABCDEFULL);
-            break;
-        case OP_COPY:
-            mem_copy(dst, src, size);
-            break;
-        case OP_LATENCY: {
-            size_t count = size / sizeof(void*);
-            g_sink += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
-            break;
-        }
-    }
-    
-    /* Time a single iteration to estimate */
-    double start = get_time();
-    switch (op) {
-        case OP_READ:
-            g_sink += mem_read(src, size);
-            break;
-        case OP_WRITE:
-            mem_write(src, size, 0x1234567890ABCDEFULL);
-            break;
-        case OP_COPY:
-            mem_copy(dst, src, size);
-            break;
-        case OP_LATENCY: {
-            size_t count = size / sizeof(void*);
-            g_sink += (uint64_t)(uintptr_t)mem_latency_chase(src, count);
-            break;
-        }
-    }
-    double time_per_iter = get_time() - start;
-    
-    if (time_per_iter < 1e-9) time_per_iter = 1e-9;
-    
-    /* Estimate iterations needed for target time */
-    int iters = (int)(TARGET_TIME_PER_TEST / time_per_iter);
-    
-    /* Clamp to valid range */
-    if (iters < MIN_ITERATIONS) iters = MIN_ITERATIONS;
-    if (iters > MAX_ITERATIONS) iters = MAX_ITERATIONS;
-    
-    return iters;
-}
-
-
-/* Run a single benchmark
- * Each thread gets its own buffer (like bw_mem) to measure aggregate system bandwidth
- */
-static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
+static result_t run_benchmark_omp(size_t size, operation_t op, int nthreads) {
     result_t result = {0};
     result.size = size;
     result.op = op;
     result.threads = nthreads;
     
-    /* For single-threaded, use dynamic timing path */
-    if (nthreads == 1) {
-        void *src = alloc_buffer(size);
-        void *dst = (op == OP_COPY) ? alloc_buffer(size) : NULL;
-        
-        if (!src || (op == OP_COPY && !dst)) {
-            free_buffer(src, size);
-            free_buffer(dst, size);
-            return result;
-        }
-        
-        if (op == OP_LATENCY) {
-            /* Initialize pointer chain for latency test */
-            size_t count = size / sizeof(void*);
-            if (count < 2) count = 2;
-            init_pointer_chain((void**)src, count);
-        } else {
-            memset(src, 0xAA, size);
-            if (dst) memset(dst, 0, size);
-        }
-        
-        /* Run dynamically until MIN_ITERATIONS and TARGET_TIME are both satisfied */
-        dynamic_result_t dyn = run_dynamic_benchmark(src, dst, size, op);
-        
-        g_sink += dyn.checksum;
-        result.iterations = dyn.iterations;
-        result.elapsed_s = dyn.elapsed;
-        
-        if (op == OP_LATENCY) {
-            /* Latency = time / total_accesses (in nanoseconds) */
-            size_t count = size / sizeof(void*);
-            size_t total_accesses = count * dyn.iterations;
-            if (dyn.elapsed > 0 && total_accesses > 0) {
-                result.latency_ns = (dyn.elapsed * 1e9) / total_accesses;
-            }
-        } else {
-            /* Bandwidth = (size per thread * threads * iterations) / time
-             * Note: for copy, we report buffer size (not 2x) to match bw_mem */
-            size_t bytes_transferred = size * dyn.iterations;
-            
-            if (dyn.elapsed > 0) {
-                result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / dyn.elapsed;
-            }
-        }
-        
-        free_buffer(src, size);
-        free_buffer(dst, size);
-        return result;
-    }
-    
-    /* Multi-threaded: each thread gets its own buffer */
-    pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-    thread_work_t *work = malloc(nthreads * sizeof(thread_work_t));
+    /* Allocate arrays for per-thread buffers and results */
     void **src_bufs = calloc(nthreads, sizeof(void*));
     void **dst_bufs = calloc(nthreads, sizeof(void*));
+    double *thread_elapsed = calloc(nthreads, sizeof(double));
+    uint64_t *thread_checksums = calloc(nthreads, sizeof(uint64_t));
+    int alloc_failed = 0;
     
-    if (!threads || !work || !src_bufs || !dst_bufs) {
-        free(threads);
-        free(work);
+    if (!src_bufs || !dst_bufs || !thread_elapsed || !thread_checksums) {
         free(src_bufs);
         free(dst_bufs);
+        free(thread_elapsed);
+        free(thread_checksums);
         return result;
     }
     
-    /* Allocate per-thread buffers */
-    for (int i = 0; i < nthreads; i++) {
-        src_bufs[i] = alloc_buffer(size);
-        dst_bufs[i] = (op == OP_COPY) ? alloc_buffer(size) : NULL;
+    /* Set OpenMP thread count */
+    omp_set_num_threads(nthreads);
+    
+    /* Phase 1: Parallel allocation with NUMA awareness
+     * proc_bind(spread) distributes threads across NUMA nodes,
+     * then each thread allocates memory locally */
+    #pragma omp parallel proc_bind(spread)
+    {
+        int tid = omp_get_thread_num();
         
-        if (!src_bufs[i] || (op == OP_COPY && !dst_bufs[i])) {
-            /* Cleanup on failure */
-            for (int j = 0; j <= i; j++) {
-                free_buffer(src_bufs[j], size);
-                free_buffer(dst_bufs[j], size);
+#ifdef USE_NUMA
+        /* Get current CPU and its NUMA node (OpenMP has placed us optimally) */
+        if (numa_available() >= 0) {
+            int cpu = sched_getcpu();
+            int node = numa_node_of_cpu(cpu);
+            if (node >= 0) {
+                /* Allocate on local NUMA node */
+                src_bufs[tid] = numa_alloc_onnode(size, node);
+                if (op == OP_COPY) {
+                    dst_bufs[tid] = numa_alloc_onnode(size, node);
+                }
             }
-            free(threads);
-            free(work);
-            free(src_bufs);
-            free(dst_bufs);
-            if (g_verbose) {
-                fprintf(stderr, "Failed to allocate %zu bytes × %d threads\n", size, nthreads);
-            }
-            return result;
+        }
+#endif
+        
+        /* Fallback: regular allocation if NUMA not available or failed */
+        if (!src_bufs[tid]) {
+            src_bufs[tid] = alloc_buffer(size);
+        }
+        if (op == OP_COPY && !dst_bufs[tid]) {
+            dst_bufs[tid] = alloc_buffer(size);
+        }
+        
+        /* Check allocation success */
+        if (!src_bufs[tid] || (op == OP_COPY && !dst_bufs[tid])) {
+            #pragma omp atomic write
+            alloc_failed = 1;
+        }
+        
+        /* Initialize buffer (first-touch for NUMA) */
+        if (src_bufs[tid]) {
+            memset(src_bufs[tid], 0xAA, size);
+        }
+        if (dst_bufs[tid]) {
+            memset(dst_bufs[tid], 0, size);
         }
     }
     
-    /* Initialize buffers */
-    if (op == OP_LATENCY) {
-        /* Initialize pointer chains for all buffers */
-        size_t count = size / sizeof(void*);
-        if (count < 2) count = 2;
+    if (alloc_failed) {
+        /* Cleanup on allocation failure */
         for (int i = 0; i < nthreads; i++) {
-            init_pointer_chain((void**)src_bufs[i], count);
+#ifdef USE_NUMA
+            if (numa_available() >= 0) {
+                if (src_bufs[i]) numa_free(src_bufs[i], size);
+                if (dst_bufs[i]) numa_free(dst_bufs[i], size);
+            } else
+#endif
+            {
+                free_buffer(src_bufs[i], size);
+                free_buffer(dst_bufs[i], size);
+            }
         }
-    } else {
-        /* Initialize first buffer for calibration */
-        memset(src_bufs[0], 0xAA, size);
-        if (dst_bufs[0]) memset(dst_bufs[0], 0, size);
+        free(src_bufs);
+        free(dst_bufs);
+        free(thread_elapsed);
+        free(thread_checksums);
+        if (g_verbose) {
+            fprintf(stderr, "Failed to allocate %zu bytes × %d threads\n", size, nthreads);
+        }
+        return result;
     }
     
-    int iterations = calibrate_iterations(src_bufs[0], dst_bufs[0], size, op);
+    /* Phase 2: Calibration - estimate iterations needed */
+    int iterations = MIN_ITERATIONS;
+    {
+        /* Warmup */
+        g_sink += mem_read(src_bufs[0], size);
+        
+        /* Time single iteration */
+        double t_start = get_time();
+        switch (op) {
+            case OP_READ:
+                g_sink += mem_read(src_bufs[0], size);
+                break;
+            case OP_WRITE:
+                mem_write(src_bufs[0], size, 0x1234567890ABCDEFULL);
+                break;
+            case OP_COPY:
+                mem_copy(dst_bufs[0], src_bufs[0], size);
+                break;
+            default:
+                break;
+        }
+        double time_per_iter = get_time() - t_start;
+        
+        if (time_per_iter > 1e-9) {
+            iterations = (int)(TARGET_TIME_PER_TEST / time_per_iter);
+            if (iterations < MIN_ITERATIONS) iterations = MIN_ITERATIONS;
+            if (iterations > MAX_ITERATIONS) iterations = MAX_ITERATIONS;
+        }
+    }
     result.iterations = iterations;
     
-    pthread_barrier_init(&g_barrier, NULL, nthreads);
-    
-    /* Setup per-thread work with NUMA-balanced CPU assignment */
-    for (int i = 0; i < nthreads; i++) {
-        work[i].src = src_bufs[i];
-        work[i].dst = dst_bufs[i];
-        work[i].size = size;
-        work[i].op = op;
-        work[i].iterations = iterations;
-        work[i].checksum = 0;
-        work[i].elapsed = 0;
-        work[i].thread_id = i;
-        work[i].cpu_id = get_cpu_for_thread(i, nthreads);  /* NUMA-balanced CPU assignment */
-        work[i].numa_node = -1;  /* Not used - memory binding done in thread using cpu_id */
-    }
-    
-    /* Launch threads */
-    for (int i = 0; i < nthreads; i++) {
-        pthread_create(&threads[i], NULL, thread_worker, &work[i]);
-    }
-    
-    /* Wait for completion */
-    for (int i = 0; i < nthreads; i++) {
-        pthread_join(threads[i], NULL);
+    /* Phase 3: Timed measurement with all threads
+     * OpenMP implicit barrier ensures all threads start together */
+    #pragma omp parallel proc_bind(spread)
+    {
+        int tid = omp_get_thread_num();
+        void *src = src_bufs[tid];
+        void *dst = dst_bufs[tid];
+        uint64_t checksum = 0;
+        
+        /* Implicit barrier here - all threads synchronized */
+        
+        double t_start = get_time();
+        
+        switch (op) {
+            case OP_READ:
+                for (int i = 0; i < iterations; i++) {
+                    checksum ^= mem_read(src, size);
+                }
+                break;
+            case OP_WRITE:
+                for (int i = 0; i < iterations; i++) {
+                    mem_write(src, size, (uint64_t)i);
+                }
+                break;
+            case OP_COPY:
+                for (int i = 0; i < iterations; i++) {
+                    mem_copy(dst, src, size);
+                }
+                break;
+            default:
+                break;
+        }
+        
+        double t_end = get_time();
+        
+        thread_elapsed[tid] = t_end - t_start;
+        thread_checksums[tid] = checksum;
     }
     
     /* Find max elapsed time (determines overall bandwidth) */
     double max_elapsed = 0;
     uint64_t total_checksum = 0;
     for (int i = 0; i < nthreads; i++) {
-        if (work[i].elapsed > max_elapsed) {
-            max_elapsed = work[i].elapsed;
+        if (thread_elapsed[i] > max_elapsed) {
+            max_elapsed = thread_elapsed[i];
         }
-        total_checksum += work[i].checksum;
+        total_checksum ^= thread_checksums[i];
     }
     
     g_sink += total_checksum;
     result.elapsed_s = max_elapsed;
     
-    if (op == OP_LATENCY) {
-        /* Latency = time / total_accesses (in nanoseconds)
-         * For latency, we report average per-thread latency, not aggregate */
-        size_t count = size / sizeof(void*);
-        size_t accesses_per_thread = count * iterations;
-        if (max_elapsed > 0 && accesses_per_thread > 0) {
-            result.latency_ns = (max_elapsed * 1e9) / accesses_per_thread;
-        }
-    } else {
-        /* Bandwidth = (size per thread * threads * iterations) / time 
-         * This gives aggregate bandwidth across all threads
-         * Note: for copy, we report buffer size (not 2x) to match bw_mem */
+    /* Calculate bandwidth = (size per thread * threads * iterations) / time
+     * This gives aggregate bandwidth across all threads.
+     * Note: for copy, we report buffer size (not 2x) to match bw_mem convention */
+    if (max_elapsed > 0) {
         size_t bytes_transferred = (size_t)size * nthreads * iterations;
-        
-        if (max_elapsed > 0) {
-            result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / max_elapsed;
-        }
+        result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / max_elapsed;
     }
     
     /* Cleanup */
-    pthread_barrier_destroy(&g_barrier);
     for (int i = 0; i < nthreads; i++) {
-        free_buffer(src_bufs[i], size);
-        free_buffer(dst_bufs[i], size);
+#ifdef USE_NUMA
+        if (numa_available() >= 0) {
+            if (src_bufs[i]) numa_free(src_bufs[i], size);
+            if (dst_bufs[i]) numa_free(dst_bufs[i], size);
+        } else
+#endif
+        {
+            free_buffer(src_bufs[i], size);
+            free_buffer(dst_bufs[i], size);
+        }
     }
-    free(threads);
-    free(work);
     free(src_bufs);
     free(dst_bufs);
+    free(thread_elapsed);
+    free(thread_checksums);
     
     return result;
+}
+
+/* Run single-threaded benchmark (for small buffers or latency) */
+static result_t run_benchmark_single(size_t size, operation_t op) {
+    result_t result = {0};
+    result.size = size;
+    result.op = op;
+    result.threads = 1;
+    
+    void *src = alloc_buffer(size);
+    void *dst = (op == OP_COPY) ? alloc_buffer(size) : NULL;
+    
+    if (!src || (op == OP_COPY && !dst)) {
+        free_buffer(src, size);
+        free_buffer(dst, size);
+        return result;
+    }
+    
+    memset(src, 0xAA, size);
+    if (dst) memset(dst, 0, size);
+    
+    /* Warmup */
+    g_sink += mem_read(src, size);
+    
+    /* Calibrate */
+    double t_start = get_time();
+    switch (op) {
+        case OP_READ: g_sink += mem_read(src, size); break;
+        case OP_WRITE: mem_write(src, size, 0x1234567890ABCDEFULL); break;
+        case OP_COPY: mem_copy(dst, src, size); break;
+        default: break;
+    }
+    double time_per_iter = get_time() - t_start;
+    
+    int iterations = MIN_ITERATIONS;
+    if (time_per_iter > 1e-9) {
+        iterations = (int)(TARGET_TIME_PER_TEST / time_per_iter);
+        if (iterations < MIN_ITERATIONS) iterations = MIN_ITERATIONS;
+        if (iterations > MAX_ITERATIONS) iterations = MAX_ITERATIONS;
+    }
+    result.iterations = iterations;
+    
+    /* Timed run */
+    uint64_t checksum = 0;
+    t_start = get_time();
+    
+    switch (op) {
+        case OP_READ:
+            for (int i = 0; i < iterations; i++) {
+                checksum ^= mem_read(src, size);
+            }
+            break;
+        case OP_WRITE:
+            for (int i = 0; i < iterations; i++) {
+                mem_write(src, size, (uint64_t)i);
+            }
+            break;
+        case OP_COPY:
+            for (int i = 0; i < iterations; i++) {
+                mem_copy(dst, src, size);
+            }
+            break;
+        default:
+            break;
+    }
+    
+    double elapsed = get_time() - t_start;
+    
+    g_sink += checksum;
+    result.elapsed_s = elapsed;
+    
+    if (elapsed > 0) {
+        size_t bytes_transferred = size * iterations;
+        result.bandwidth_mb_s = (bytes_transferred / (1024.0 * 1024.0)) / elapsed;
+    }
+    
+    free_buffer(src, size);
+    free_buffer(dst, size);
+    
+    return result;
+}
+
+/* Main benchmark runner - dispatches to OpenMP or single-threaded */
+static result_t run_benchmark(size_t size, operation_t op, int nthreads) {
+    if (nthreads == 1) {
+        return run_benchmark_single(size, op);
+    }
+    return run_benchmark_omp(size, op, nthreads);
 }
 
 /* Run benchmark multiple times and return best result (like lmbench TRIES)
@@ -1851,13 +1645,11 @@ static size_t round_to_power_of_2(size_t size) {
  * 
  * Generates sizes at critical cache transition points to show:
  * 1. Pure L1 performance
- * 2. L1 boundary  
- * 3. L1→L2 transition (between L1 and L2)
- * 4. Pure L2 performance
- * 5. L2 boundary
- * 6. L2→L3 transition (between L2 and L3/RAM)
- * 7. L3 region
- * 8-9. Pure RAM bandwidth (64MB, 256MB)
+ * 2. L1→L2 transition
+ * 3. Pure L2 performance
+ * 4. L2→L3 transition
+ * 5. L3 region
+ * 6. Pure RAM bandwidth
  * 
  * All sizes are strictly increasing with no overlaps.
  */
@@ -1884,32 +1676,31 @@ static size_t* get_sizes(int *count) {
         if (_s > prev && _s <= max_size) { sizes_list[n++] = _s; prev = _s; } \
     } while(0)
     
-    /* L1 region - single point is enough, L1 performance is flat */
-    ADD_SIZE(l1 / 2);                    /* Pure L1 (e.g., 32KB for 64KB L1) */
+    /* L1 region */
+    ADD_SIZE(l1 / 2);
     
     /* L1→L2 transition */
-    ADD_SIZE(l1 * 2);                    /* Past L1, into L2 */
+    ADD_SIZE(l1 * 2);
     
     /* L2 region */
-    ADD_SIZE(l2 / 2);                    /* Mid L2 */
-    ADD_SIZE(l2);                        /* L2 boundary */
+    ADD_SIZE(l2 / 2);
+    ADD_SIZE(l2);
     
     /* L2→L3 transition */
-    ADD_SIZE(l2 * 2);                    /* Past L2, into L3 */
+    ADD_SIZE(l2 * 2);
     
-    /* L3 region - just need 1-2 points to show the L3 plateau
-     * Don't need many points since L3 latency is relatively flat */
+    /* L3 region */
     if (l3 > l2 * 4) {
-        ADD_SIZE(l3 / 4);                /* Mid L3 (e.g., 32MB for 128MB L3) */
+        ADD_SIZE(l3 / 4);
     }
-    ADD_SIZE(l3 / 2);                    /* Late L3 (e.g., 64MB for 128MB L3) */
+    ADD_SIZE(l3 / 2);
     
     /* L3→RAM transition */
-    ADD_SIZE(l3);                        /* L3 boundary */
+    ADD_SIZE(l3);
     
     /* RAM region */
-    ADD_SIZE(l3 * 2);                    /* Past L3, into RAM */
-    ADD_SIZE(l3 * 4);                    /* Deep in RAM */
+    ADD_SIZE(l3 * 2);
+    ADD_SIZE(l3 * 4);
     
     /* Full sweep: add larger sizes up to memory limit */
     if (g_full_sweep) {
@@ -1966,11 +1757,11 @@ static void print_result(const result_t *r) {
  * 2GB should cover any current processor. */
 #define MAX_LATENCY_SIZE (2UL * 1024 * 1024 * 1024)  /* 2 GB */
 
-/* Run benchmark for a given per-thread buffer size.
+/* Find best configuration for a given buffer size and operation.
  * 
  * This follows bw_mem's approach:
- * - size_kb is the per-thread buffer size
- * - Total memory = size_kb * threads (or size_kb * threads * 2 for copy)
+ * - buffer_size is the per-thread buffer size
+ * - Total memory = buffer_size * threads (or buffer_size * threads * 2 for copy)
  * 
  * Three modes:
  * 1. Auto-scaling (g_auto_scaling=1): Try multiple thread counts, find best
@@ -1985,14 +1776,12 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
     
     /* For latency test: single-thread, statistically valid measurement */
     if (op == OP_LATENCY) {
-        /* Cap buffer size for very large latency tests */
         size_t max_latency = MAX_LATENCY_SIZE;
         if (g_total_memory / 4 < max_latency) {
             max_latency = g_total_memory / 4;
         }
         size_t latency_size = (buffer_size > max_latency) ? max_latency : buffer_size;
         
-        /* Use new statistically valid measurement */
         double start = get_time();
         latency_stats_t stats = measure_latency_stats(latency_size);
         double elapsed = get_time() - start;
@@ -2000,7 +1789,7 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
         best.size = buffer_size;
         best.op = op;
         best.threads = 1;
-        best.latency_ns = stats.median_ns;       /* Use median (robust to outliers) */
+        best.latency_ns = stats.median_ns;
         best.latency_mean_ns = stats.mean_ns;
         best.latency_stddev_ns = stats.stddev_ns;
         best.latency_cv = stats.cv;
@@ -2011,7 +1800,7 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
         return best;
     }
     
-    /* Bandwidth tests: buffer_size is per-thread */
+    /* Bandwidth tests */
     int nthreads;
     
     if (g_auto_scaling) {
@@ -2020,14 +1809,12 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
             nthreads = thread_counts[i];
             if (nthreads < 1) continue;
             
-            /* Check memory limit (buffer_size per thread, ×2 for copy) */
             int bufs_per_op = (op == OP_COPY) ? 2 : 1;
             size_t memory_needed = buffer_size * nthreads * bufs_per_op;
             if (memory_needed > g_total_memory / 4) {
                 continue;
             }
             
-            /* Run benchmark */
             result_t r = run_benchmark_best(buffer_size, op, nthreads);
             r.size = buffer_size;
             
@@ -2036,7 +1823,6 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
             }
         }
         
-        /* If no valid configuration found, try single thread */
         if (best.bandwidth_mb_s == 0) {
             best = run_benchmark_best(buffer_size, op, 1);
             best.size = buffer_size;
@@ -2045,7 +1831,7 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
         return best;
     }
     
-    /* Fixed thread count mode (default or explicit) */
+    /* Fixed thread count mode */
     if (g_explicit_threads > 0) {
         nthreads = g_explicit_threads;
     } else {
@@ -2060,7 +1846,6 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
         memory_needed = buffer_size * nthreads * bufs_per_op;
     }
     
-    /* Run benchmark */
     best = run_benchmark_best(buffer_size, op, nthreads);
     best.size = buffer_size;
     
@@ -2070,11 +1855,10 @@ static result_t find_best_config(size_t buffer_size, operation_t op,
 static void run_all_benchmarks(void) {
     double start_time = get_time();
     
-    /* Get thread counts */
     int tc_count;
     int *thread_counts = get_thread_counts(&tc_count);
     
-    /* Single size mode: test only the specified size */
+    /* Single size mode */
     if (g_single_size > 0) {
         if (g_verbose) {
             fprintf(stderr, "Testing buffer size: %zu KB per thread\n",
@@ -2084,7 +1868,6 @@ static void run_all_benchmarks(void) {
         print_csv_header();
         
         for (int op = 0; op < 4 && g_running; op++) {
-            /* Skip operations not in the selected mask */
             if (!(g_ops_mask & (1 << op))) continue;
             
             result_t best = find_best_config(g_single_size, (operation_t)op, 
@@ -2105,7 +1888,7 @@ static void run_all_benchmarks(void) {
         return;
     }
     
-    /* Normal mode: test all sizes (adaptive based on cache hierarchy) */
+    /* Normal mode: test all sizes */
     int size_count;
     size_t *sizes = get_sizes(&size_count);
     
@@ -2118,25 +1901,15 @@ static void run_all_benchmarks(void) {
         } else {
             fprintf(stderr, "Thread mode: num_cpus (%d threads)\n", g_num_cpus);
         }
-        fprintf(stderr, "Size range: %zu KB - %.2f MB%s\n", 
-                sizes[0] / 1024,
-                sizes[size_count-1] / (1024.0 * 1024.0),
-                g_full_sweep ? " (full sweep)" : "");
-        if (g_max_runtime > 0) {
-            fprintf(stderr, "Target runtime: %.0f seconds\n", g_max_runtime);
-        } else {
-            fprintf(stderr, "Target runtime: unlimited\n");
-        }
+        fprintf(stderr, "OpenMP: proc_bind(spread) for NUMA-aware thread placement\n");
     }
     
     print_csv_header();
     
-    /* Run benchmarks from small to large */
     for (int s = 0; s < size_count && g_running; s++) {
         size_t size = sizes[s];
         
         for (int op = 0; op < 4 && g_running; op++) {
-            /* Skip operations not in the selected mask */
             if (!(g_ops_mask & (1 << op))) continue;
             
             result_t best = find_best_config(size, (operation_t)op, 
@@ -2147,7 +1920,6 @@ static void run_all_benchmarks(void) {
                 fflush(stdout);
             }
             
-            /* Check time budget (0 = unlimited) */
             if (g_max_runtime > 0) {
                 double elapsed = get_time() - start_time;
                 if (elapsed > g_max_runtime) {
@@ -2175,7 +1947,7 @@ static void run_all_benchmarks(void) {
  * ============================================================================ */
 
 static void usage(const char *prog) {
-    fprintf(stderr, "sc-membench %s - Memory Bandwidth Benchmark\n\n", VERSION);
+    fprintf(stderr, "sc-membench %s - Memory Bandwidth Benchmark (OpenMP)\n\n", VERSION);
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h          Show this help\n");
@@ -2195,8 +1967,13 @@ static void usage(const char *prog) {
     fprintf(stderr, "              Uses THP (no setup needed) or explicit 2MB pages\n");
     fprintf(stderr, "              Automatically skipped for small buffers\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "OpenMP Thread Affinity (environment variables):\n");
+    fprintf(stderr, "  OMP_PROC_BIND=spread  Spread threads across NUMA nodes (default)\n");
+    fprintf(stderr, "  OMP_PLACES=cores      One thread per physical core\n");
+    fprintf(stderr, "  OMP_NUM_THREADS=N     Override thread count\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "Output: CSV to stdout with columns:\n");
-    fprintf(stderr, "  size_kb        - Per-thread buffer size (KB)\n");
+    fprintf(stderr, "  size_kb           - Per-thread buffer size (KB)\n");
     fprintf(stderr, "  operation         - read, write, copy, or latency\n");
     fprintf(stderr, "  bandwidth_mb_s    - Aggregate bandwidth in MB/s (0 for latency)\n");
     fprintf(stderr, "  latency_ns        - Median memory latency in ns (0 for bandwidth)\n");
@@ -2213,7 +1990,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "Memory model: each thread gets its own buffer.\n");
     fprintf(stderr, "Total memory = size_kb × threads (×2 for copy: src + dst).\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "Compile with -DUSE_NUMA -lnuma for NUMA support.\n");
+    fprintf(stderr, "Compile with -DUSE_NUMA -lnuma for explicit NUMA allocation.\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -2307,4 +2084,3 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
-
