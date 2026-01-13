@@ -6,7 +6,8 @@ A portable, multi-platform memory bandwidth benchmark designed for comprehensive
 
 - **Multi-platform**: Works on x86, arm64, and other architectures
 - **Multiple operations**: Measures read, write, copy bandwidth + memory latency
-- **NUMA-aware**: Automatically handles NUMA systems (optional, works on non-NUMA too)
+- **OpenMP parallelization**: Uses OpenMP for efficient multi-threaded bandwidth measurement
+- **NUMA-aware**: Automatically handles NUMA systems with `proc_bind(spread)` thread placement
 - **Cache-aware sizing**: Adaptive test sizes based on detected L1, L2, L3 cache hierarchy
 - **Per-thread buffer model**: Like bw_mem, each thread gets its own buffer
 - **Thread control**: Default uses all CPUs; optional auto-scaling to find optimal thread count
@@ -263,6 +264,29 @@ Example for 1MB buffer size with 4 threads (copy):
 | **Explicit** | `-p N` | Use exactly N threads |
 | **Auto-scaling** | `-a` | Try 1, 2, 4, ..., num_cpus threads, report best |
 
+### OpenMP Thread Affinity
+
+You can fine-tune thread placement using OpenMP environment variables:
+
+```bash
+# Spread threads across NUMA nodes (default behavior)
+OMP_PROC_BIND=spread OMP_PLACES=cores ./membench
+
+# Bind threads close together (may reduce bandwidth on multi-socket)
+OMP_PROC_BIND=close OMP_PLACES=cores ./membench
+
+# Override thread count via environment
+OMP_NUM_THREADS=8 ./membench
+```
+
+| Variable | Values | Effect |
+|----------|--------|--------|
+| `OMP_PROC_BIND` | `spread`, `close`, `master` | Thread distribution strategy |
+| `OMP_PLACES` | `cores`, `threads`, `sockets` | Placement units |
+| `OMP_NUM_THREADS` | Integer | Override thread count |
+
+The default `proc_bind(spread)` in the code distributes threads evenly across NUMA nodes for maximum memory bandwidth.
+
 ### What the Benchmark Measures
 
 - **Aggregate bandwidth**: Sum of all threads' bandwidth
@@ -309,11 +333,13 @@ Without balancing (sequential):          With balancing (round-robin):
 
 ### NUMA-Local Memory
 
-Each thread's buffer is bound to its local NUMA node using `mbind(MPOL_BIND)`:
+Each thread allocates its buffer directly on its local NUMA node using `numa_alloc_onnode()`:
 
 ```c
-int node = numa_node_of_cpu(cpu_id);
-mbind(buffer, size, MPOL_BIND, &nodemask, ...);
+// Inside OpenMP parallel region with proc_bind(spread)
+int cpu = sched_getcpu();
+int node = numa_node_of_cpu(cpu);
+buffer = numa_alloc_onnode(size, node);
 ```
 
 This ensures:
@@ -479,11 +505,11 @@ Achieving consistent benchmark results on modern multi-core systems requires car
 
 ### Thread Pinning
 
-Each thread is pinned to a specific CPU using `pthread_setaffinity_np()`. This prevents the OS scheduler from migrating threads between cores, which causes huge variability.
+Threads are distributed across CPUs using OpenMP's `proc_bind(spread)` clause, which spreads threads evenly across NUMA nodes and physical cores. This prevents the OS scheduler from migrating threads between cores, which causes huge variability.
 
 ### NUMA-Aware Memory
 
-On NUMA systems, memory is bound to the local NUMA node of each thread's CPU using `mbind(MPOL_BIND)`. This ensures:
+On NUMA systems, each thread allocates memory directly on its local NUMA node using `numa_alloc_onnode()`. OpenMP's `proc_bind(spread)` ensures threads are distributed across NUMA nodes, then each thread allocates locally. This ensures:
 - Memory is close to where it will be accessed
 - No cross-node memory access penalties
 - No memory migrations during the benchmark
@@ -525,7 +551,7 @@ With these optimizations, benchmark variability is typically **<1%** (compared t
 
 | Aspect | sc-membench | lmbench bw_mem |
 |--------|-------------|----------------|
-| **Parallelism model** | Threads | Processes (fork) |
+| **Parallelism model** | OpenMP threads | Processes (fork) |
 | **Buffer allocation** | Each thread has own buffer | Each process has own buffer |
 | **Size reporting** | Per-thread buffer size | Per-process buffer size |
 | **Read operation** | Reads 100% of data | `rd` reads 25% (strided) |
@@ -600,22 +626,35 @@ Typical modern systems:
 
 ## Dependencies
 
-- **Required**: POSIX threads (pthread), C11 compiler (gcc or clang)
+### Build Requirements
+
+- **Required**: C11 compiler with OpenMP support (gcc or clang)
 - **Recommended**: hwloc 2.x for portable cache topology detection
 - **Optional**: libnuma for NUMA support (Linux only)
 - **Optional**: libhugetlbfs for huge page size detection (Linux only)
 
+### Runtime Requirements
+
+- **Required**: OpenMP runtime library (`libgomp1` on Debian/Ubuntu, `libgomp` on RHEL)
+- **Optional**: libhwloc, libnuma, libhugetlbfs (same as build dependencies)
+
 ### Installing Dependencies
 
 ```bash
-# Debian/Ubuntu
+# Debian/Ubuntu - Build
 apt-get install build-essential libhwloc-dev libnuma-dev libhugetlbfs-dev
 
-# RHEL/CentOS/Fedora
+# Debian/Ubuntu - Runtime only (e.g., Docker images)
+apt-get install libgomp1 libhwloc15 libnuma1 libhugetlbfs-dev
+
+# RHEL/CentOS/Fedora - Build
 yum install gcc make hwloc-devel numactl-devel libhugetlbfs-devel
 
+# RHEL/CentOS/Fedora - Runtime only
+yum install libgomp hwloc-libs numactl-libs libhugetlbfs
+
 # macOS (hwloc only, no NUMA)
-brew install hwloc
+brew install hwloc libomp
 xcode-select --install
 
 # FreeBSD (hwloc 2 required, not hwloc 1)
@@ -624,11 +663,12 @@ pkg install gmake hwloc2
 
 ### What Each Dependency Provides
 
-| Library | Purpose | Platforms |
-|---------|---------|-----------|
-| **hwloc 2** | Cache topology detection (L1/L2/L3 sizes) | Linux, macOS, BSD |
-| **libnuma** | NUMA-aware memory allocation | Linux only |
-| **libhugetlbfs** | Huge page size detection | Linux only |
+| Library | Purpose | Platforms | Build/Runtime |
+|---------|---------|-----------|---------------|
+| **libgomp** | OpenMP runtime (parallel execution) | All | Both |
+| **hwloc 2** | Cache topology detection (L1/L2/L3 sizes) | Linux, macOS, BSD | Both |
+| **libnuma** | NUMA-aware memory allocation | Linux only | Both |
+| **libhugetlbfs** | Huge page size detection | Linux only | Both |
 
 **Note**: hwloc 2.x is required. hwloc 1.x uses a different API and is not supported.
 
