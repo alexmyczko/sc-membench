@@ -58,7 +58,7 @@ docker run --rm --privileged ghcr.io/sparecores/membench:main -H > results.csv
 
 **Notes:**
 - The `--privileged` flag is recommended for optimal CPU pinning and NUMA support
-- The `-H` flag enables huge pages automatically for large buffers (≥ 4MB), no setup required
+- The `-H` flag enables huge pages automatically for large buffers (≥ 2× huge page size), no setup required
 
 ## Build Options
 
@@ -78,8 +78,8 @@ For production use on servers, build with all features:
 
 ```bash
 # Install dependencies first
-sudo apt-get install libhwloc-dev libnuma-dev  # Debian/Ubuntu
-# or: sudo yum install hwloc-devel numactl-devel  # RHEL/CentOS
+sudo apt-get install libhugetlbfs-dev libhwloc-dev libnuma-dev  # Debian/Ubuntu
+# or: sudo yum install libhugetlbfs-devel hwloc-devel numactl-devel  # RHEL/CentOS
 
 # Build with full features
 make full
@@ -105,7 +105,7 @@ Options:
   -t SECONDS  Maximum runtime, 0 = unlimited (default: unlimited)
   -o OP       Run only this operation: read, write, copy, or latency
               Can be specified multiple times (default: all)
-  -H          Enable huge pages for large buffers (>= 4MB)
+  -H          Enable huge pages for large buffers (>= 2x huge page size)
               Uses THP automatically, no setup required
 ```
 
@@ -144,7 +144,7 @@ size_kb,operation,bandwidth_mb_s,latency_ns,latency_stddev_ns,latency_samples,th
 262144,latency,0,122.22,0.90,7,1,7,21.756578
 ```
 
-In this example (96-core Azure D96pls_v6 with 64KB L1, 1MB L2, 128MB L3):
+In this example ([Azure D96pls_v6](https://sparecores.com/server/azure/Standard_D96pls_v6) with 96 ARM cores, 64KB L1, 1MB L2, 128MB L3):
 - **32KB**: Fits in L1 → very high bandwidth (~9.3 TB/s read), low latency (~1.8ns, stddev 0.00)
 - **512KB**: Fits in L2 → good latency (~5.7ns, stddev 0.01)
 - **32MB**: In L3 → moderate latency (~45ns, stddev 0.03)
@@ -344,7 +344,7 @@ Use `-H` to enable huge pages (2MB instead of 4KB). This reduces TLB (Translatio
 
 The `-H` option is designed to "just work":
 
-1. **Automatic threshold**: Huge pages are only used for buffers ≥ 4MB. Smaller buffers use regular pages automatically (no wasted memory, no user intervention needed).
+1. **Automatic threshold**: Huge pages are only used for buffers ≥ 2× huge page size (typically 4MB on systems with 2MB huge pages). The huge page size is detected dynamically via `libhugetlbfs`. Smaller buffers use regular pages automatically (no wasted memory, no user intervention needed).
 
 2. **No setup required**: The benchmark uses **Transparent Huge Pages (THP)** via `madvise(MADV_HUGEPAGE)`, which is handled automatically by the Linux kernel. No root access or pre-allocation needed.
 
@@ -352,9 +352,9 @@ The `-H` option is designed to "just work":
 
 ### How it works
 
-When `-H` is enabled and buffer size ≥ 4MB:
+When `-H` is enabled and buffer size ≥ threshold (2× huge page size):
 
-1. **First tries explicit huge pages** (`MAP_HUGETLB`) for deterministic 2MB pages
+1. **First tries explicit huge pages** (`MAP_HUGETLB`) for deterministic huge pages
 2. **Falls back to THP** (`madvise(MADV_HUGEPAGE)`) which works without pre-configuration
 3. **Falls back to regular pages** if neither is available
 
@@ -425,28 +425,48 @@ With 2MB huge pages:
 
 ### Real-world benchmark results
 
-Measured on [**AWS c8a.metal-48xl**](https://sparecores.com/server/aws/c8a.metal-48xl) (192 AMD EPYC 9R45 cores, 2 NUMA nodes, L1d=48KB/core, L2=1MB/core, L3=32MB/die × 24 dies):
+#### Azure D96pls_v6 (ARM)
 
-| Buffer | No Huge Pages | THP Only | Pre-allocated HP | THP Improvement |
-|--------|---------------|----------|------------------|-----------------|
-| 32 KB  | 0.89 ns | 0.89 ns | 0.89 ns | HP not used (< 4MB) |
-| 64 KB  | 1.53 ns | 1.54 ns | 1.54 ns | HP not used (< 4MB) |
-| 128 KB | 2.35 ns | 2.35 ns | 2.36 ns | HP not used (< 4MB) |
-| 512 KB | 3.31 ns | 3.31 ns | 3.31 ns | HP not used (< 4MB) |
-| 1 MB   | 4.69 ns | 4.60 ns | 5.37 ns | HP not used (< 4MB) |
-| 2 MB   | 8.61 ns | 8.66 ns | 8.68 ns | HP not used (< 4MB) |
-| 16 MB  | 12.30 ns | 10.70 ns | 10.70 ns | -13% |
-| **32 MB** | **29.16 ns** | **11.17 ns** | **11.16 ns** | **-62%** |
-| **64 MB** | **86.06 ns** | **74.05 ns** | **74.32 ns** | **-14%** |
-| **128 MB** | **115.65 ns** | **101.08 ns** | **102.28 ns** | **-13%** |
+Measured on [**Azure D96pls_v6**](https://sparecores.com/server/azure/Standard_D96pls_v6) (96 ARM Neoverse-N2 cores, 2 NUMA nodes, L1d=64KB/core, L2=1MB/core, L3=128MB shared):
+
+| Buffer | No Huge Pages | With THP (-H) | Improvement |
+|--------|---------------|---------------|-------------|
+| 32 KB  | 1.77 ns | 1.77 ns | HP not used (< 4MB) |
+| 128 KB | 3.95 ns | 3.95 ns | HP not used (< 4MB) |
+| 512 KB | 5.99 ns | 5.98 ns | HP not used (< 4MB) |
+| 1 MB   | 11.52 ns | 10.92 ns | HP not used (< 4MB) |
+| 2 MB   | 24.27 ns | 24.65 ns | HP not used (< 4MB) |
+| **32 MB** | 44.90 ns | **36.23 ns** | **-19%** |
+| **64 MB** | 49.40 ns | **40.77 ns** | **-17%** |
+| **128 MB** | 92.50 ns | **78.32 ns** | **-15%** |
+| **256 MB** | 121.92 ns | **107.65 ns** | **-12%** |
+| **512 MB** | 140.97 ns | **118.74 ns** | **-16%** |
+
+#### AWS c8a.metal-48xl (AMD)
+
+Measured on [**AWS c8a.metal-48xl**](https://sparecores.com/server/aws/c8a.metal-48xl) (192 AMD EPYC 9R45 cores, 2 NUMA nodes, L1d=48KB/core, L2=1MB/core, L3=32MB/die):
+
+| Buffer | No Huge Pages | With THP (-H) | Improvement |
+|--------|---------------|---------------|-------------|
+| 32 KB  | 0.89 ns | 0.89 ns | HP not used (< 4MB) |
+| 128 KB | 2.43 ns | 2.45 ns | HP not used (< 4MB) |
+| 512 KB | 3.32 ns | 3.35 ns | HP not used (< 4MB) |
+| 1 MB   | 5.47 ns | 4.09 ns | HP not used (< 4MB) |
+| 2 MB   | 8.85 ns | 8.85 ns | HP not used (< 4MB) |
+| **8 MB** | 11.72 ns | **10.32 ns** | **-12%** |
+| **16 MB** | 12.58 ns | **10.74 ns** | **-15%** |
+| **32 MB** | **30.83 ns** | **11.29 ns** | **-63%** |
+| **64 MB** | 84.81 ns | **75.25 ns** | **-11%** |
+| **128 MB** | 117.75 ns | **105.45 ns** | **-10%** |
 
 **Key observations:**
 - **Small buffers (≤ 2MB)**: No significant difference — TLB can handle the page count
-- **32 MB buffer**: Dramatic **62% improvement** — this is right at the L3 cache boundary (32MB/die)
-- **Large buffers (≥ 64MB)**: 13-14% lower latency with huge pages
-- **THP vs pre-allocated**: Nearly identical results — THP works just as well without manual setup
+- **L3 boundary effect**: AMD shows **63% improvement at 32MB** (exactly at L3 size) — without huge pages, TLB misses make L3 appear like RAM!
+- **L3 region**: 12-19% improvement with huge pages
+- **RAM region**: 10-16% lower latency with huge pages
+- **THP works automatically**: No pre-allocation needed, just use `-H`
 
-**Bottom line**: Use `-H` for accurate latency measurements on large buffers. THP (automatic) works as well as pre-allocated huge pages.
+**Bottom line**: Use `-H` for accurate latency measurements on large buffers. Without huge pages, TLB overhead can severely distort results, especially at cache boundaries.
 
 **Bandwidth tests** don't improve as much because:
 - Sequential access has better TLB locality (same pages accessed repeatedly)

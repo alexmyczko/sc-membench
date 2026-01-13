@@ -11,9 +11,9 @@
  * - Outputs CSV format for analysis
  *
  * Compile:
- *   gcc -O3 -pthread -o membench membench.c -lm
+ *   gcc -O3 -pthread -o membench membench.c -lm -lhugetlbfs
  *   # With NUMA support (optional):
- *   gcc -O3 -pthread -DUSE_NUMA -o membench membench.c -lnuma -lm
+ *   gcc -O3 -pthread -DUSE_NUMA -o membench membench.c -lnuma -lm -lhugetlbfs
  *
  * Usage:
  *   ./membench [options]
@@ -36,6 +36,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <math.h>
+#include <hugetlbfs.h>
 
 #ifdef USE_NUMA
 #include <numa.h>
@@ -63,6 +64,25 @@
 /* Fixed RAM sizes for when we need to measure pure memory bandwidth */
 #define RAM_SIZE_1 (64UL * 1024 * 1024)   /* 64 MB - definitely past any L3 */
 #define RAM_SIZE_2 (256UL * 1024 * 1024)  /* 256 MB - more RAM data points */
+
+/* Get huge page size dynamically from the system via libhugetlbfs.
+ * Returns the default huge page size (typically 2MB on x86, varies on ARM).
+ * Falls back to 2MB if the library call fails. */
+static size_t get_huge_page_size(void) {
+    static size_t cached_size = 0;
+    if (cached_size == 0) {
+        long size = gethugepagesize();
+        cached_size = (size > 0) ? (size_t)size : (2UL * 1024 * 1024);
+    }
+    return cached_size;
+}
+
+/* Minimum buffer size to use huge pages (2 huge pages).
+ * Below this threshold, TLB pressure isn't significant and huge pages
+ * would waste memory (each allocation rounds up to huge page boundary). */
+static size_t get_huge_page_threshold(void) {
+    return 2 * get_huge_page_size();
+}
 
 /* ============================================================================
  * Types
@@ -346,15 +366,58 @@ static void shuffle_nodes(LatencyNode **nodes, size_t n) {
     }
 }
 
-/* Allocate memory for latency chain with NUMA awareness
- * Uses mmap for large allocations and binds to local NUMA node when available */
+/* Allocate memory for latency chain with NUMA awareness and huge page support
+ * Uses mmap with optional huge pages to reduce TLB overhead for large buffers */
 static LatencyNode* alloc_latency_memory(size_t num_nodes, size_t *alloc_size) {
     size_t size = num_nodes * sizeof(LatencyNode);
     *alloc_size = size;
     
-    /* Use mmap for consistent behavior with rest of benchmark */
-    LatencyNode *memory = (LatencyNode *)mmap(NULL, size, PROT_READ | PROT_WRITE,
-                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    LatencyNode *memory = MAP_FAILED;
+    int try_hugepages = g_use_hugepages && (size >= get_huge_page_threshold());
+    
+    if (try_hugepages) {
+        /* Round up size to huge page boundary */
+        size_t hp_size = get_huge_page_size();
+        size_t aligned_size = (size + hp_size - 1) & ~(hp_size - 1);
+        *alloc_size = aligned_size;
+        
+#ifdef MAP_HUGETLB
+        /* Try explicit huge pages first */
+        memory = (LatencyNode *)mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        if (memory != MAP_FAILED) {
+            if (g_verbose >= 2) {
+                fprintf(stderr, "  Latency: allocated %zu bytes using explicit 2MB huge pages\n", aligned_size);
+            }
+        }
+#endif
+        
+        /* Fall back to THP (Transparent Huge Pages) */
+        if (memory == MAP_FAILED) {
+            memory = (LatencyNode *)mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (memory != MAP_FAILED) {
+#ifdef MADV_HUGEPAGE
+                if (madvise(memory, size, MADV_HUGEPAGE) == 0) {
+                    if (g_verbose >= 2) {
+                        fprintf(stderr, "  Latency: allocated %zu bytes with THP (transparent huge pages)\n", size);
+                    }
+                } else if (g_verbose >= 2) {
+                    fprintf(stderr, "  Latency: allocated %zu bytes (THP hint failed)\n", size);
+                }
+#endif
+                *alloc_size = size;  /* Reset to actual size for THP */
+            }
+        }
+    }
+    
+    /* Regular allocation if huge pages disabled or failed */
+    if (memory == MAP_FAILED) {
+        memory = (LatencyNode *)mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        *alloc_size = size;
+    }
+    
     if (memory == MAP_FAILED) return NULL;
     
 #ifdef USE_NUMA
@@ -363,7 +426,7 @@ static LatencyNode* alloc_latency_memory(size_t num_nodes, size_t *alloc_size) {
         int node = numa_node_of_cpu(0);
         if (node >= 0) {
             unsigned long nodemask = 1UL << node;
-            mbind(memory, size, MPOL_BIND, &nodemask, g_numa_nodes + 1, MPOL_MF_MOVE);
+            mbind(memory, *alloc_size, MPOL_BIND, &nodemask, g_numa_nodes + 1, MPOL_MF_MOVE);
             if (g_verbose >= 2) {
                 fprintf(stderr, "  Latency memory bound to NUMA node %d\n", node);
             }
@@ -767,17 +830,9 @@ static void* thread_worker(void *arg) {
  * Memory allocation
  * ============================================================================ */
 
-/* Huge page size (2MB on most Linux systems) */
-#define HUGE_PAGE_SIZE (2UL * 1024 * 1024)
-
-/* Minimum buffer size to use huge pages (4MB = 2 huge pages).
- * Below this threshold, TLB pressure isn't significant and huge pages
- * would waste memory (each allocation rounds up to 2MB boundary). */
-#define HUGE_PAGE_THRESHOLD (4UL * 1024 * 1024)
-
 static void* alloc_buffer(size_t size) {
     void *buf = MAP_FAILED;
-    int try_hugepages = g_use_hugepages && (size >= HUGE_PAGE_THRESHOLD);
+    int try_hugepages = g_use_hugepages && (size >= get_huge_page_threshold());
     
     if (try_hugepages) {
         /* 
@@ -791,7 +846,8 @@ static void* alloc_buffer(size_t size) {
          */
         
         /* Round up size to huge page boundary for explicit huge pages */
-        size_t aligned_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+        size_t hp_size = get_huge_page_size();
+        size_t aligned_size = (size + hp_size - 1) & ~(hp_size - 1);
         
 #ifdef MAP_HUGETLB
         /* Try explicit huge pages (uses pre-allocated pool if available) */
@@ -799,7 +855,8 @@ static void* alloc_buffer(size_t size) {
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (buf != MAP_FAILED) {
             if (g_verbose >= 2) {
-                fprintf(stderr, "  Allocated %zu bytes using explicit 2MB huge pages\n", aligned_size);
+                fprintf(stderr, "  Allocated %zu bytes using explicit %zu KB huge pages\n", 
+                        aligned_size, hp_size / 1024);
             }
             /* Touch all pages to ensure they're allocated */
             memset(buf, 0, size);

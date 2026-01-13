@@ -10,13 +10,13 @@
 #   make test      - Quick test run
 #
 # Dependencies:
-#   Basic:    gcc, pthread, math library (standard)
+#   Basic:    gcc, pthread, math library, libhugetlbfs (standard)
 #   hwloc:    libhwloc-dev (Debian/Ubuntu), hwloc-devel (RHEL/CentOS), hwloc (macOS)
 #   NUMA:     libnuma-dev (Debian/Ubuntu), numactl-devel (RHEL/CentOS)
 
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -std=c11 -march=native
-LDFLAGS = -pthread -lm
+LDFLAGS = -pthread -lm -lhugetlbfs
 
 # Source files
 SRC = membench.c
@@ -85,5 +85,6 @@ help:
 	@echo "  make all      - Build all versions"
 	@echo ""
 	@echo "Dependencies:"
-	@echo "  hwloc: apt install libhwloc-dev  (or: yum install hwloc-devel)"
-	@echo "  NUMA:  apt install libnuma-dev   (or: yum install numactl-devel)"
+	@echo "  Basic: apt install libhugetlbfs-dev (or: yum install libhugetlbfs-devel)"
+	@echo "  hwloc: apt install libhwloc-dev     (or: yum install hwloc-devel)"
+	@echo "  NUMA:  apt install libnuma-dev      (or: yum install numactl-devel)"
