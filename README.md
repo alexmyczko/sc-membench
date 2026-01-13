@@ -43,16 +43,16 @@ The easiest way to run sc-membench without building is using the pre-built Docke
 docker run --rm ghcr.io/sparecores/membench:main
 
 # Run with verbose output and time limit
-docker run --rm ghcr.io/sparecores/membench:main membench -v -t 300
+docker run --rm ghcr.io/sparecores/membench:main -v -t 300
 
 # Test specific buffer size
-docker run --rm ghcr.io/sparecores/membench:main membench -s 1024
+docker run --rm ghcr.io/sparecores/membench:main -s 1024
 
 # Recommended: use --privileged and huge pages for best accuracy
-docker run --rm --privileged ghcr.io/sparecores/membench:main membench -H -v
+docker run --rm --privileged ghcr.io/sparecores/membench:main -H -v
 
 # Save output to file
-docker run --rm --privileged ghcr.io/sparecores/membench:main membench -H > results.csv
+docker run --rm --privileged ghcr.io/sparecores/membench:main -H > results.csv
 ```
 
 **Notes:**
