@@ -10,8 +10,9 @@ A portable, multi-platform memory bandwidth benchmark designed for comprehensive
 - **Cache-aware sizing**: Adaptive test sizes based on detected L1, L2, L3 cache hierarchy
 - **Per-thread buffer model**: Like bw_mem, each thread gets its own buffer
 - **Thread control**: Default uses all CPUs; optional auto-scaling to find optimal thread count
-- **Latency measurement**: True memory latency using pointer chasing
-- **Best-of-N runs**: Each test runs multiple times, reports best result (like lmbench)
+- **Latency measurement**: True memory latency using pointer chasing with statistical sampling
+- **Statistically valid**: Latency reports median, stddev, and sample count (CV < 5%)
+- **Best-of-N runs**: Bandwidth tests run multiple times, reports best result (like lmbench)
 - **CSV output**: Machine-readable output for analysis
 
 ## Quick Start
@@ -117,7 +118,9 @@ CSV output to stdout with columns:
 | `size_kb` | **Per-thread** buffer size (KB) |
 | `operation` | Operation type: `read`, `write`, `copy`, or `latency` |
 | `bandwidth_mb_s` | Aggregate bandwidth across all threads (MB/s), 0 for latency |
-| `latency_ns` | Memory latency (nanoseconds), 0 for bandwidth tests |
+| `latency_ns` | Median memory latency (nanoseconds), 0 for bandwidth tests |
+| `latency_stddev_ns` | Standard deviation of latency samples (nanoseconds), 0 for bandwidth |
+| `latency_samples` | Number of samples collected for latency measurement, 0 for bandwidth |
 | `threads` | Thread count used |
 | `iterations` | Number of iterations performed |
 | `elapsed_s` | Elapsed time for the test (seconds) |
@@ -127,22 +130,26 @@ CSV output to stdout with columns:
 ### Example Output
 
 ```csv
-size_kb,operation,bandwidth_mb_s,latency_ns,threads,iterations,elapsed_s
-16,read,2276940.70,0,48,589309,0.19
-16,write,1302796.66,0,48,350557,0.20
-16,latency,0,1.07,1,48176,0.11
-512,read,807264.98,0,48,11728,0.35
-512,write,726262.08,0,48,8512,0.29
-512,latency,0,4.78,1,316,0.10
-65536,read,113577.83,0,48,23,0.62
-65536,write,46728.81,0,48,20,1.31
-65536,latency,0,65.12,1,3,1.64
+size_kb,operation,bandwidth_mb_s,latency_ns,latency_stddev_ns,latency_samples,threads,iterations,elapsed_s
+32,read,9309701.64,0,0,0,96,292056,0.094113
+32,write,9868845.93,0,0,0,96,578703,0.175918
+32,latency,0,1.77,0.00,7,1,7,0.254053
+128,read,6410473.70,0,0,0,96,83556,0.156412
+128,write,9883443.78,0,0,0,96,177556,0.215580
+128,latency,0,3.93,0.00,7,1,7,0.689736
+512,latency,0,5.66,0.01,7,1,7,0.654846
+1024,latency,0,7.38,0.04,7,1,7,0.671615
+32768,latency,0,44.90,0.03,7,1,7,1.050579
+131072,latency,0,96.78,3.00,7,1,7,8.520152
+262144,latency,0,122.22,0.90,7,1,7,21.756578
 ```
 
-In this example (48-core system with 32KB L1, 1MB L2, 36MB L3):
-- **16KB**: Fits in L1 → very high bandwidth (~2.3 TB/s read), low latency (~1ns)
-- **512KB**: Fits in L2 → good bandwidth (~800 GB/s read), moderate latency (~5ns)
-- **64MB**: Past L3 → RAM bandwidth (~114 GB/s read), high latency (~65ns)
+In this example (96-core Azure D96pls_v6 with 64KB L1, 1MB L2, 128MB L3):
+- **32KB**: Fits in L1 → very high bandwidth (~9.3 TB/s read), low latency (~1.8ns, stddev 0.00)
+- **512KB**: Fits in L2 → good latency (~5.7ns, stddev 0.01)
+- **32MB**: In L3 → moderate latency (~45ns, stddev 0.03)
+- **128MB**: At L3 boundary → RAM latency visible (~97ns, stddev 3.0)
+- **256MB**: Past L3 → pure RAM latency (~122ns, stddev 0.9)
 
 ## Operations Explained
 
@@ -170,26 +177,34 @@ dst[i] = src[i];  // For all elements
 **Note:** Copy bandwidth is typically lower than read or write alone because it performs both operations. The reported bandwidth represents the buffer size traversed, not total bytes moved (read + write).
 
 ### Latency (`latency`)
-Measures true memory access latency using **pointer chasing**. Each memory access depends on the previous one, preventing CPU pipelining and prefetching.
+Measures true memory access latency using **pointer chasing** with a linked list traversal approach inspired by [ram_bench](https://github.com/emilk/ram_bench) by Emil Ernerfeldt. Each memory access depends on the previous one, preventing CPU pipelining and prefetching.
 
 ```c
+// Node structure (16 bytes) - realistic for linked list traversal
+struct Node {
+    uint64_t payload;  // Dummy data for realistic cache behavior
+    Node *next;        // Pointer to next node
+};
+
 // Each load depends on previous (can't be optimized away)
-p = *p;  // Address comes from previous load
-p = *p;
-p = *p;
-// ...
+node = node->next;  // Address comes from previous load
 ```
 
-The buffer is initialized as a linked list of pointers in **randomized order** to defeat hardware prefetchers. This measures:
+The buffer is initialized as a contiguous array of nodes linked in **randomized order** to defeat hardware prefetchers. This measures:
 - L1/L2/L3 cache hit latency at small sizes
 - DRAM access latency at large sizes
 - True memory latency without pipelining effects
 
-Results are reported in **nanoseconds per access**, not MB/s.
+**Statistical validity**: The latency measurement collects **multiple independent samples** (7-21) and reports the **median** (robust to outliers) along with standard deviation. Sampling continues until coefficient of variation < 5% or maximum samples reached.
+
+**CPU and NUMA pinning**: The latency test pins to CPU 0 and allocates memory on the local NUMA node (when compiled with NUMA support) for consistent, reproducible results.
+
+Results are reported in **nanoseconds per access** with statistical measures:
+- `latency_ns`: Median latency (robust central tendency)
+- `latency_stddev_ns`: Standard deviation (measurement precision indicator)
+- `latency_samples`: Number of samples collected (statistical effort)
 
 **Large L3 cache support**: The latency test uses buffers up to 2GB (or 25% of RAM) to correctly measure DRAM latency even on processors with huge L3 caches like AMD EPYC 9754 (1.1GB L3 with 3D V-Cache).
-
-**Adaptive early termination**: For buffer sizes >1.5GB in series mode, when DRAM latency is detected (>50ns), the benchmark uses adaptive termination to stop early once measurements stabilize. This helps on systems with both large caches and slower DRAM.
 
 ## Memory Sizes Tested
 
@@ -197,18 +212,18 @@ The benchmark tests **per-thread buffer sizes** at cache transition points, auto
 
 ### Adaptive Cache-Aware Sizes
 
-Based on detected L1, L2, L3 cache sizes:
+Based on detected L1, L2, L3 cache sizes (typically 10 sizes):
 
 | Size | Purpose |
 |------|---------|
-| L1/2 | Pure L1 cache performance |
-| L1 | L1 cache boundary |
-| 2×L1 | L1→L2 transition (if fits before L2/2) |
-| L2/2 | Pure L2 cache performance |
+| L1/2 | Pure L1 cache performance (e.g., 32KB for 64KB L1) |
+| 2×L1 | L1→L2 transition |
+| L2/2 | Mid L2 cache performance |
 | L2 | L2 cache boundary |
-| 2×L2 | L2→L3 transition (if fits before L3/2) |
-| L3/2 | Mid L3 cache |
-| L3 | L3 cache boundary |
+| 2×L2 | L2→L3 transition |
+| L3/4 | Mid L3 cache (for large L3 caches) |
+| L3/2 | Late L3 cache |
+| L3 | L3→RAM boundary |
 | 2×L3 | Past L3, hitting RAM |
 | 4×L3 | Deep into RAM |
 
@@ -453,14 +468,23 @@ On NUMA systems, memory is bound to the local NUMA node of each thread's CPU usi
 - No cross-node memory access penalties
 - No memory migrations during the benchmark
 
-### Best-of-N Runs
+### Bandwidth: Best-of-N Runs
 
-Like lmbench (TRIES=11), each test configuration runs multiple times and reports the best result:
+Like lmbench (TRIES=11), each bandwidth test configuration runs multiple times and reports the best result:
 
 1. First run is a warmup (discarded) to stabilize CPU frequency
 2. Each configuration is then tested 3 times (configurable with `-r`)
-3. For bandwidth: highest bandwidth is reported
-4. For latency: lowest latency is reported
+3. Highest bandwidth is reported (best shows true hardware capability)
+
+### Latency: Statistical Sampling
+
+Latency measurements use a different approach optimized for statistical validity:
+
+1. Thread is pinned to CPU 0 with NUMA-local memory
+2. Multiple independent samples (7-21) are collected per measurement
+3. Sampling continues until coefficient of variation < 5% or max samples reached
+4. **Median** latency is reported (robust to outliers)
+5. Standard deviation and sample count are included for validation
 
 ### Result
 
@@ -505,16 +529,24 @@ sc-membench's `latency` operation is comparable to lmbench's `lat_mem_rd`:
 
 | Aspect | sc-membench latency | lmbench lat_mem_rd |
 |--------|---------------------|-------------------|
-| **Method** | Pointer chasing | Pointer chasing |
+| **Method** | Pointer chasing (linked list) | Pointer chasing (array) |
+| **Node structure** | 16 bytes (payload + pointer) | 8 bytes (pointer only) |
 | **Pointer order** | Randomized (defeats prefetching) | Fixed backward stride (may be prefetched) |
 | **Stride** | Random (visits all elements) | Configurable (default 64 bytes on 64-bit) |
-| **Output** | Nanoseconds | Nanoseconds |
+| **Statistical validity** | Multiple samples, reports median + stddev | Single measurement |
+| **CPU/NUMA pinning** | Pins to CPU 0, NUMA-local memory | No pinning |
+| **Output** | Median nanoseconds + stddev + sample count | Nanoseconds |
 | **Huge pages** | Built-in (`-H` flag) | Not supported |
-| **TLB measurement** | Compare with/without `-H` | Mentioned but no support |
 
-Both measure memory latency using dependent loads (`p = *p`) that prevent pipelining.
+Both measure memory latency using dependent loads that prevent pipelining.
 
-**Key difference - prefetching vulnerability**: lat_mem_rd uses fixed backward stride, which modern CPUs may prefetch (the man page acknowledges: "vulnerable to smart, stride-sensitive cache prefetching policies"). sc-membench's randomized pointer chain defeats all prefetching, measuring true random-access latency.
+**Key differences**:
+
+1. **Prefetching vulnerability**: lat_mem_rd uses fixed backward stride, which modern CPUs may prefetch (the man page acknowledges: "vulnerable to smart, stride-sensitive cache prefetching policies"). sc-membench's randomized pointer chain defeats all prefetching, measuring true random-access latency.
+
+2. **Statistical validity**: sc-membench collects 7-21 samples per measurement, reports median (robust to outliers) and standard deviation, and continues until coefficient of variation < 5%. This provides confidence in the results.
+
+3. **Reproducibility**: CPU pinning and NUMA-local memory allocation eliminate variability from thread migration and remote memory access.
 
 **Huge pages advantage**: With `-H`, sc-membench automatically uses huge pages for large buffers, eliminating TLB overhead that can inflate latency by 20-40% (see [benchmark results](#real-world-benchmark-results)).
 
