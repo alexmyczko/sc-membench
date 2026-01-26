@@ -108,6 +108,8 @@ Options:
               Can be specified multiple times (default: all)
   -H          Enable huge pages for large buffers (>= 2x huge page size)
               Uses THP automatically, no setup required
+  -R          Human-readable output with summary and benchmark scores
+              (default: CSV output)
 ```
 
 ## Output Format
@@ -151,6 +153,89 @@ In this example ([Azure D96pls_v6](https://sparecores.com/server/azure/Standard_
 - **32MB**: In L3 → moderate latency (~45ns, stddev 0.03)
 - **128MB**: At L3 boundary → RAM latency visible (~97ns, stddev 3.0)
 - **256MB**: Past L3 → pure RAM latency (~122ns, stddev 0.9)
+
+## Human-Readable Output (`-R`)
+
+Use `-R` for a formatted table with summary statistics and benchmark scores instead of CSV:
+
+```bash
+./membench -R
+```
+
+### Example Output
+
+```
+Size       Op          Bandwidth      Latency  Threads
+----       --          ---------      -------  -------
+32 KB      read         2.6 TB/s            -       32
+32 KB      write        1.6 TB/s            -       32
+32 KB      copy       464.4 GB/s            -       32
+32 KB      latency             -       0.9 ns        1
+128 KB     read         1.7 TB/s            -       32
+128 KB     write      691.7 GB/s            -       32
+128 KB     copy       495.5 GB/s            -       32
+128 KB     latency             -       2.4 ns        1
+...
+
+================================================================================
+                           BENCHMARK SUMMARY
+================================================================================
+
+BANDWIDTH (MB/s):
+  Operation          Peak Weighted Avg
+  ---------          ---- ------------
+  Read            2612561      1680432
+  Write           1605601       850445
+  Copy             495476       372027
+
+LATENCY:
+  Best latency: 97.2 ns (RAM) at 131072 KB buffer
+
+--------------------------------------------------------------------------------
+BENCHMARK SCORE (higher is better):
+
+  Bandwidth Score:      1571.2  (avg peak bandwidth in GB/s)
+  Latency Score:          10.3  (1000 / latency_ns)
+
+  >> COMBINED SCORE:      4024  (sqrt(bw_score × latency_score) × 100)
+--------------------------------------------------------------------------------
+```
+
+### Summary Statistics
+
+| Metric | Description |
+|--------|-------------|
+| **Peak** | Highest bandwidth achieved across all buffer sizes |
+| **Weighted Avg** | Average weighted by log₂(size) — larger buffers count more |
+| **Best latency** | Latency at the largest buffer size tested (closest to true RAM latency) |
+
+### Benchmark Scores
+
+The summary includes scores for easy comparison between systems:
+
+| Score | Formula | Description |
+|-------|---------|-------------|
+| **Bandwidth Score** | `avg(peak_read, peak_write, peak_copy) / 1000` | Average peak bandwidth in GB/s |
+| **Latency Score** | `1000 / latency_ns` | Inverse of RAM latency (higher = faster) |
+| **Combined Score** | `sqrt(bw_score × latency_score) × 100` | Geometric mean of both (balanced) |
+
+The **Combined Score** uses a geometric mean so that neither bandwidth nor latency dominates — both contribute equally to the final score.
+
+### Score Comparability Warning
+
+When using options that affect test coverage, a warning is displayed:
+
+```
+WARNING: Scores may not be comparable due to non-default options:
+  - Time limit (-t 60) may have prevented testing larger buffer sizes
+  - Fixed thread count (-p 4) instead of using all CPUs (32)
+For comparable scores, run without -t, -p, or -s options.
+```
+
+**For comparable benchmark scores**, run without `-t`, `-p`, or `-s` options to ensure:
+- All buffer sizes are tested (including large RAM-sized buffers)
+- All CPUs are utilized (maximum bandwidth)
+- Full cache hierarchy is exercised
 
 ## Operations Explained
 
