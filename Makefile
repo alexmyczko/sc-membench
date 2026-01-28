@@ -4,19 +4,13 @@
 # Uses OpenMP for parallel bandwidth measurement
 #
 # Build options:
-#   make           - Auto-detect features and build optimal version
+#   make           - Auto-detect features and build universal binary
 #   make basic     - Build minimal version (no optional dependencies)
 #   make hwloc     - Build with hwloc (portable cache detection)
 #   make numa      - Build with NUMA support (Linux only)
 #   make full      - Build with all available features
-#   make all       - Build all versions
 #   make clean     - Remove built files
 #   make test      - Quick test run
-#
-# The default 'make' target automatically detects:
-#   - Available compiler (gcc or clang)
-#   - Platform (Linux, macOS, FreeBSD)
-#   - Available libraries (hwloc, numa, hugetlbfs)
 
 # =============================================================================
 # Platform and Compiler Detection
@@ -34,17 +28,33 @@ CFLAGS_BASE = -O3 -Wall -Wextra -std=c11
 # OpenMP flag (same for gcc and clang)
 OPENMP_FLAG = -fopenmp
 
-# Platform-specific adjustments
-# Note: Platform is auto-detected in code, these are just for build optimization
+# =============================================================================
+# Source Files and Targets
+# =============================================================================
+
+SRC = membench.c
+TARGET = membench
+TARGET_BASIC = membench-basic
+TARGET_HWLOC = membench-hwloc
+TARGET_NUMA = membench-numa
+TARGET_FULL = membench-full
+
+# =============================================================================
+# Platform-Specific Universal Optimization Flags
+# =============================================================================
+
+# Platform-specific adjustments with UNIVERSAL compatibility
 ifeq ($(UNAME_S),Darwin)
     # macOS: packages typically in /opt/homebrew (ARM) or /usr/local (Intel)
     ARCH := $(shell uname -m)
     ifeq ($(ARCH),arm64)
-        CFLAGS_ARCH = -mcpu=native
+        # ARM64 macOS: Use generic ARMv8-A (works on all Apple Silicon)
+        CFLAGS_ARCH = -mcpu=generic
         CFLAGS_PATHS = -I/opt/homebrew/include
         LDFLAGS_PATHS = -L/opt/homebrew/lib
     else
-        CFLAGS_ARCH = -march=native
+        # x86_64 macOS: Use baseline x86-64 (works on all Intel Macs)
+        CFLAGS_ARCH = -march=x86-64 -mtune=generic
         CFLAGS_PATHS = -I/usr/local/include
         LDFLAGS_PATHS = -L/usr/local/lib
     endif
@@ -58,27 +68,39 @@ ifeq ($(UNAME_S),Darwin)
         OPENMP_LIBS =
     endif
 else ifeq ($(UNAME_S),FreeBSD)
-    # FreeBSD: packages in /usr/local
-    CFLAGS_ARCH = -march=native
+    # FreeBSD: packages in /usr/local, use baseline x86-64
+    CFLAGS_ARCH = -march=x86-64 -mtune=generic
     CFLAGS_PATHS = -I/usr/local/include
     LDFLAGS_PATHS = -L/usr/local/lib
     LDFLAGS_BASE = -lm
     OPENMP_LIBS =
 else ifeq ($(UNAME_S),OpenBSD)
-    CFLAGS_ARCH = -march=native
+    CFLAGS_ARCH = -march=x86-64 -mtune=generic
     CFLAGS_PATHS = -I/usr/local/include
     LDFLAGS_PATHS = -L/usr/local/lib
     LDFLAGS_BASE = -lm
     OPENMP_LIBS =
 else ifeq ($(UNAME_S),NetBSD)
-    CFLAGS_ARCH = -march=native
+    CFLAGS_ARCH = -march=x86-64 -mtune=generic
     CFLAGS_PATHS = -I/usr/local/include -I/usr/pkg/include
     LDFLAGS_PATHS = -L/usr/local/lib -L/usr/pkg/lib
     LDFLAGS_BASE = -lm
     OPENMP_LIBS =
 else
-    # Linux (default)
-    CFLAGS_ARCH = -march=native
+    # Linux (default) - Use conservative, universally compatible flags
+    ARCH := $(shell uname -m)
+    ifeq ($(ARCH),aarch64)
+        # ARM64: Use generic ARMv8-A with CRC (universally supported)
+        # This works on all ARM64 CPUs from Cortex-A53 to Neoverse-V2
+        CFLAGS_ARCH = -mcpu=generic+crc
+    else ifeq ($(ARCH),x86_64)
+        # x86_64: Use baseline x86-64 with SSE2 (universally supported since 2003)
+        # This works on all x86_64 CPUs from Opteron/Pentium 4 to latest Xeon/EPYC
+        CFLAGS_ARCH = -march=x86-64 -mtune=generic
+    else
+        # Other architectures: use generic optimization
+        CFLAGS_ARCH = -mtune=generic
+    endif
     CFLAGS_PATHS =
     LDFLAGS_PATHS =
     LDFLAGS_BASE = -lm
@@ -114,22 +136,6 @@ else
     HAVE_HUGETLBFS := no
 endif
 
-# =============================================================================
-# Build Targets
-# =============================================================================
-
-SRC = membench.c
-TARGET = membench
-TARGET_BASIC = membench-basic
-TARGET_HWLOC = membench-hwloc
-TARGET_NUMA = membench-numa
-TARGET_FULL = membench-full
-
-.PHONY: default all clean test basic hwloc numa full help info
-
-# Default: auto-detect and build optimal version
-default: $(TARGET)
-
 # Auto-detect features and compile with all available
 DETECTED_DEFS =
 DETECTED_LIBS =
@@ -149,9 +155,19 @@ ifeq ($(HAVE_NUMA),yes)
     DETECTED_LIBS += -lnuma
 endif
 
+# =============================================================================
+# Build Targets
+# =============================================================================
+
+.PHONY: default all clean test basic hwloc numa full help info
+
+# Default: auto-detect and build universal binary
+default: $(TARGET)
+
 $(TARGET): $(SRC)
-	@echo "Building for $(UNAME_S) with auto-detected features..."
+	@echo "Building universal binary for $(UNAME_S) $(ARCH)..."
 	@echo "  Compiler: $(CC)"
+	@echo "  Optimization: $(CFLAGS_ARCH) (universal compatibility)"
 	@echo "  OpenMP:   enabled"
 	@echo "  hwloc:    $(HAVE_HWLOC)"
 	@echo "  numa:     $(HAVE_NUMA)"
@@ -227,18 +243,6 @@ endif
 test: $(TARGET)
 	./$(TARGET) -v -t 30
 
-# Test with hwloc
-test-hwloc: $(TARGET_HWLOC)
-	./$(TARGET_HWLOC) -v -t 30
-
-# Test with NUMA
-test-numa: $(TARGET_NUMA)
-	./$(TARGET_NUMA) -v -t 30
-
-# Test with full features
-test-full: $(TARGET_FULL)
-	./$(TARGET_FULL) -v -t 30
-
 clean:
 	rm -f $(TARGET) $(TARGET_BASIC) $(TARGET_HWLOC) $(TARGET_NUMA) $(TARGET_FULL)
 
@@ -250,6 +254,7 @@ install: $(TARGET)
 info:
 	@echo "Platform Detection:"
 	@echo "  OS:        $(UNAME_S)"
+	@echo "  Arch:      $(ARCH)"
 	@echo "  Compiler:  $(CC)"
 	@echo "  CFLAGS:    $(CFLAGS)"
 	@echo "  LDFLAGS:   $(LDFLAGS)"
@@ -258,19 +263,35 @@ info:
 	@echo "  hwloc:     $(HAVE_HWLOC)"
 	@echo "  numa:      $(HAVE_NUMA)"
 	@echo "  hugetlbfs: $(HAVE_HUGETLBFS)"
+	@echo ""
+	@echo "Universal Optimization:"
+ifeq ($(ARCH),aarch64)
+	@echo "  ARM64:     -mcpu=generic+crc (works on all ARM64 CPUs)"
+else ifeq ($(ARCH),x86_64)
+	@echo "  x86_64:    -march=x86-64 (works on all x86_64 CPUs since 2003)"
+else
+	@echo "  Other:     -mtune=generic"
+endif
 
 # Help target
 help:
-	@echo "sc-membench - Portable Memory Benchmark (OpenMP)"
+	@echo "sc-membench - Universal Memory Benchmark (OpenMP)"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  make          - Auto-detect features and build optimal version"
+	@echo "  make          - Auto-detect features and build universal binary"
 	@echo "  make basic    - Minimal build (no optional dependencies)"
 	@echo "  make hwloc    - With hwloc (portable cache detection)"
 	@echo "  make numa     - With NUMA support (Linux only)"
 	@echo "  make full     - With all features (hwloc + numa, Linux recommended)"
 	@echo "  make all      - Build all available versions"
 	@echo "  make info     - Show detected platform and libraries"
+	@echo ""
+	@echo "Universal Compatibility:"
+	@echo "  This build system uses conservative optimization flags that work"
+	@echo "  on ALL CPUs of the target architecture:"
+	@echo "    - ARM64: -mcpu=generic+crc (Cortex-A53 to Neoverse-V2)"
+	@echo "    - x86_64: -march=x86-64 (Opteron/P4 to latest Xeon/EPYC)"
+	@echo "  No illegal instruction errors, works in any Docker container."
 	@echo ""
 	@echo "OpenMP thread control (environment variables):"
 	@echo "  OMP_PROC_BIND=spread    Distribute threads across NUMA nodes"
